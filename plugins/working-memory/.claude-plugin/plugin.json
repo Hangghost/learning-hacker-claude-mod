@@ -1,0 +1,1 @@
+{ "name": "working-memory", "version": "0.1.0", "description": "把 context window 畫成一顆腦：工具呼叫點亮對應腦區，用量越滿越擁擠，compact 時睡眠整理", "author": { "name": "Hangghost", "url": "https://github.com/Hangghost" }, "types": "./types/index.d.ts" }

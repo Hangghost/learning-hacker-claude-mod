@@ -1,0 +1,15 @@
+{
+  "name": "learning-hacker-claude-mod",
+  "description": "Learning Hacker 的 Claude Code mods：把 agent 的運作畫成看得懂的東西",
+  "owner": {
+    "name": "Hangghost",
+    "url": "https://github.com/Hangghost"
+  },
+  "plugins": [
+    {
+      "name": "working-memory",
+      "source": "./plugins/working-memory",
+      "description": "把 context window 畫成一顆腦：工具呼叫點亮對應腦區，用量越滿越擁擠，compact 時睡眠整理"
+    }
+  ]
+}
