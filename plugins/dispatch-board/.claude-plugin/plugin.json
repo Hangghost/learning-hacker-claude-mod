@@ -1,0 +1,15 @@
+{
+  "name": "dispatch-board",
+  "version": "0.1.0",
+  "description": "多個 Claude Code session 分工時的派工看板：讀你寫的 mission 檔，顯示誰完成、誰在跑、誰在等你，狀態轉換時跳 toast",
+  "author": { "name": "Hangghost", "url": "https://github.com/Hangghost" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "missions_dir": {
+      "type": "string",
+      "title": "mission 目錄",
+      "description": "放 mission 檔（*.json）的目錄，須為 ~/… 或絕對路徑，且在家目錄底下、不在任何 git repo 內。自訂值只認 ~/.claude/settings.json 裡的設定。",
+      "default": "~/.claude/missions"
+    }
+  }
+}

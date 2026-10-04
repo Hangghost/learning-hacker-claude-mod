@@ -1,0 +1,25 @@
+{
+  "mission_id": "shop-redesign",
+  "title": "商店改版",
+  "nodes": [
+    {
+      "id": "api",
+      "title": "後端 API",
+      "session": "shop-api",
+      "done": "git -C ~/code/shop log --oneline origin/feature/api | grep -q '\\[api-done\\]'"
+    },
+    {
+      "id": "web",
+      "title": "前端頁面",
+      "session": "shop-web",
+      "done": "test -f ~/code/shop/web/dist/index.html"
+    },
+    {
+      "id": "e2e",
+      "title": "端對端測試",
+      "session": "shop-e2e",
+      "done": "grep -q 'ALL PASSED' ~/code/shop/e2e-report.txt",
+      "depends_on": ["api", "web"]
+    }
+  ]
+}
