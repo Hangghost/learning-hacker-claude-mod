@@ -1,0 +1,27 @@
+{
+  "name": "handoff-runner",
+  "version": "0.1.0",
+  "description": "bg session 在 worktree 做完的分支，由你在面板按一顆按鈕快轉進 main：交接單只帶參數，步驟由 mod 推導，執行前檢查、執行後驗證",
+  "author": { "name": "Hangghost", "url": "https://github.com/Hangghost" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "push": {
+      "type": "boolean",
+      "title": "落地後 push",
+      "description": "快轉成功後把目標分支 push 到 remote（預設關閉）",
+      "default": false
+    },
+    "remote": {
+      "type": "string",
+      "title": "push 的 remote",
+      "description": "push 開啟時使用的 remote 名稱",
+      "default": "origin"
+    },
+    "defaultTarget": {
+      "type": "string",
+      "title": "預設目標分支",
+      "description": "簽發交接單時沒指定目標就用這個分支",
+      "default": "main"
+    }
+  }
+}
