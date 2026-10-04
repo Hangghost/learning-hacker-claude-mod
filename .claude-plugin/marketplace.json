@@ -1,6 +1,6 @@
 {
   "name": "learning-hacker-claude-mod",
-  "description": "Learning Hacker 的 Claude Code mods：把 agent 的運作畫成看得懂的東西",
+  "description": "Learning Hacker 的 Claude Code mods：把 agent 的運作畫成看得懂的東西，並把多 session 協作變順",
   "owner": {
     "name": "Hangghost",
     "url": "https://github.com/Hangghost"
@@ -10,6 +10,16 @@
       "name": "working-memory",
       "source": "./plugins/working-memory",
       "description": "把 context window 畫成一顆腦：工具呼叫點亮對應腦區，用量越滿越擁擠，compact 時睡眠整理"
+    },
+    {
+      "name": "dispatch-board",
+      "source": "./plugins/dispatch-board",
+      "description": "多個 Claude Code session 分工時的派工看板：讀你寫的 mission 檔，顯示誰完成、誰在跑、誰在等你，狀態轉換時跳 toast"
+    },
+    {
+      "name": "handoff-runner",
+      "source": "./plugins/handoff-runner",
+      "description": "bg session 在 worktree 做完的分支，由你在面板按一顆按鈕快轉進 main：交接單只帶參數，執行前檢查、執行後驗證"
     }
   ]
 }
