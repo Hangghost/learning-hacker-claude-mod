@@ -21,7 +21,6 @@ import {
   ROSTER_TIMEOUT_MS,
   SECTION_ID,
   buildMessage,
-  configRefusal,
   degradeFailedLine,
   degradePrompt,
   degradedLine,
@@ -38,6 +37,7 @@ import {
   ownName,
   parseMission,
   parseRoster,
+  pickDir,
   resolveStation,
   sendCheckVerdict,
   truncate,
@@ -85,12 +85,11 @@ type Located = { kind: 'ok'; realDir: string } | { kind: 'missing' } | { kind: '
 async function locate($: any): Promise<Located> {
   const home = await $.env.get('HOME')
   if (!home || !home.startsWith('/')) return { kind: 'refused', error: '讀不到家目錄（HOME 未設定），不讀任何 mission 檔' }
-  if (dirSetting.trim() !== DEFAULT_DIR) {
-    const userSettings = await $.settings.read({ source: 'user' }).catch(() => ({}))
-    const refused = configRefusal(dirSetting, userSettings)
-    if (refused) return { kind: 'refused', error: refused }
-  }
-  const expanded = expandDir(dirSetting, home)
+  // 只讀使用者層級設定：本 mod 自訂值的來源檢查，以及沿用 dispatch-board 的 missions_dir。
+  const userSettings = await $.settings.read({ source: 'user' }).catch(() => ({}))
+  const picked = pickDir(dirSetting, userSettings ?? {})
+  if (!picked.ok) return { kind: 'refused', error: picked.error }
+  const expanded = expandDir(picked.dir, home)
   if (!expanded.ok) return { kind: 'refused', error: expanded.error }
   const realHome = await realPathOf($, home)
   if (!realHome) return { kind: 'refused', error: `家目錄 ${home} 解析不了，不讀任何 mission 檔` }
@@ -145,14 +144,16 @@ async function fetchRoster($: any): Promise<Roster> {
 /**
  * 身份判定；never throw。沒有任何 mission 選用 relay（沒有 `station`）時不讀名冊、不啟動任何程式：
  * 本 mod 經 marketplace 安裝會在每個 session 載入，沒用到它的 session 不該付這個成本。
+ * `full`：已啟用的 worker 重新判定時一律讀名冊，停用訊息才能分辨「節點還在但 mission 拿掉了 station」與「沒有節點」。
  */
-async function resolve($: any): Promise<{ res: Resolution; roster: Roster | null }> {
+async function resolve($: any, full = false): Promise<{ res: Resolution; roster: Roster | null }> {
   try {
     const where = await locate($)
     if (where.kind === 'refused') return { res: { kind: 'unavailable', reason: where.error }, roster: null }
-    if (where.kind === 'missing') return { res: { kind: 'none' }, roster: null }
+    if (where.kind === 'missing') return { res: { kind: 'no-missions' }, roster: null }
     const missions = await loadMissions($, where.realDir)
-    if (!missions.some(m => m.station)) return { res: { kind: 'none' }, roster: null }
+    if (missions.length === 0) return { res: { kind: 'no-missions' }, roster: null }
+    if (!full && !missions.some(m => m.station)) return { res: { kind: 'no-relay' }, roster: null }
     let sessionId = ''
     try {
       sessionId = String((await $.session.id()) ?? '')
@@ -341,7 +342,7 @@ export const register: Register = (on, options) => {
     if (identity === null || e.reason !== 'answer') return r
 
     // 每次送件前重新判定：mission 檔被搬走或改派、session 改名時停用；指揮站重開換 id 也跟得上。
-    const { res, roster } = await resolve($)
+    const { res, roster } = await resolve($, true)
     if (res.kind !== 'match') {
       identity = null
       logInactive($, `停用（${inactiveLog(res)}）`)

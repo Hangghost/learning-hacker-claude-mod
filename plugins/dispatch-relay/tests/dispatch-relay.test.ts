@@ -14,9 +14,11 @@ import {
   degradePrompt,
   dirRefusal,
   findIdentity,
+  inactiveLog,
   injectionText,
   parseMission,
   parseRoster,
+  pickDir,
   resolveStation,
   sendCheckVerdict,
   submitFailure,
@@ -145,8 +147,8 @@ describe('logic：名冊與身份', () => {
     const one = missions([{ mission_id: 'shop', station: 'shop-lead', nodes: NODES }])
     const m = findIdentity(one, 'SHOP-API')
     expect(m).toEqual({ kind: 'match', identity: { missionId: 'shop', nodeId: 'api', station: 'shop-lead', resultFile: '.mission-result.md' } })
-    expect(findIdentity(one, 'someone')).toEqual({ kind: 'none' })
-    expect(findIdentity(one, '')).toEqual({ kind: 'none' })
+    expect(findIdentity(one, 'someone')).toEqual({ kind: 'none', name: 'someone' })
+    expect(findIdentity(one, '')).toEqual({ kind: 'none', name: '' })
     const two = missions([
       { mission_id: 'shop', station: 'shop-lead', nodes: NODES },
       { mission_id: 'blog', station: 'lead', nodes: [{ id: 'x', session: 'shop-api' }] },
@@ -171,17 +173,46 @@ describe('logic：注入段、降級文字、tool.check 判定', () => {
     expect(t).not.toContain('AskUserQuestion')
   })
 
-  test('降級 prompt：from 指引在前、上次位址其次、station 名稱最後，各占一行', async () => {
+  test('降級 prompt：station 名稱第一順位、上次位址其次、from 最後且僅限來自指揮站，各占一行', async () => {
     const built = buildMessage(IDS, undefined, 'x', '', false)
     const p = degradePrompt(built, 'gone', 'reports/api.md', { station: 'shop-lead', lastDelivered: 'uds:/tmp/s.sock' })
     expect(p).toContain('gone')
     expect(p).toContain('reports/api.md')
     expect(p).toContain('不要為此另外寫檔')
     const lines = p.split('\n')
-    const at = ['from 位址', 'uds:/tmp/s.sock', 'shop-lead'].map(s => lines.findIndex(l => l.includes(s)))
+    const at = ['收件者：shop-lead', 'uds:/tmp/s.sock', 'from 位址'].map(s => lines.findIndex(l => l.includes(s)))
     expect(at.every(i => i >= 0)).toBe(true)
     expect(at[0]! < at[1]! && at[1]! < at[2]!).toBe(true)
-    expect(degradePrompt(built, 'gone', 'r.md', { station: 'shop-lead' })).not.toContain('uds:')
+    // from 備援只認指揮站的來訊：第三方 session 的訊息不算
+    const fromLine = lines[at[2]!]!
+    expect(fromLine).toContain('僅當該則來自指揮站 shop-lead')
+    expect(fromLine).toContain('來自其他 session 的訊息不算')
+    const noAddr = degradePrompt(built, 'gone', 'r.md', { station: 'shop-lead' }).split('\n')
+    expect(noAddr.join('\n')).not.toContain('uds:')
+    expect(noAddr.findIndex(l => l.includes('收件者：shop-lead'))).toBeLessThan(noAddr.findIndex(l => l.includes('from 位址')))
+  })
+
+  test('inactiveLog：分辨「找到節點但 mission 沒有 station」「沒有指派給本 session 的節點」「沒有 mission 選用 relay」', async () => {
+    const noStation = inactiveLog({ kind: 'no-station', missionId: 'shop', nodeId: 'api' })
+    const none = inactiveLog({ kind: 'none', name: 'shop-api' })
+    const noRelay = inactiveLog({ kind: 'no-relay' })
+    expect(noStation).toContain('找到指派給本 session 的節點 shop/api')
+    expect(noStation).toContain('沒有 station')
+    expect(none).toContain('沒有指派給本 session（shop-api）的節點')
+    expect(none).not.toContain('station')
+    expect(noRelay).toContain('沒有任何 mission 寫 station')
+    expect(new Set([noStation, none, noRelay]).size).toBe(3)
+  })
+
+  test('pickDir：relay 自己的 → dispatch-board 的 → 預設；都只認使用者層級設定', async () => {
+    const cfg = (o: Record<string, string>) => ({ pluginConfigs: Object.fromEntries(Object.entries(o).map(([k, v]) => [k, { options: { missions_dir: v } }])) })
+    expect(pickDir('~/.claude/missions', {})).toEqual({ ok: true, dir: '~/.claude/missions' })
+    expect(pickDir('~/.claude/missions', cfg({ 'dispatch-board@mkt': '~/b' }))).toEqual({ ok: true, dir: '~/b' })
+    expect(pickDir('~/r', cfg({ 'dispatch-relay@mkt': '~/r', 'dispatch-board@mkt': '~/b' }))).toEqual({ ok: true, dir: '~/r' })
+    // relay 自己在使用者設定明寫預設值：仍以 relay 的為準，不改用 board 的
+    expect(pickDir('~/.claude/missions', cfg({ 'dispatch-relay': '~/.claude/missions', 'dispatch-board': '~/b' }))).toEqual({ ok: true, dir: '~/.claude/missions' })
+    // relay 的非預設值不是使用者層級給的：拒絕，不退而改用 board 的
+    expect(pickDir('~/r', cfg({ 'dispatch-board': '~/b' })).ok).toBe(false)
   })
 
   test('degradeFailedLine：分別交代結果檔與最終回覆，不暗示有人接手', async () => {
@@ -221,6 +252,7 @@ type World = {
   files: Map<string, string>
   links: Map<string, string>
   userSettings: Record<string, unknown>
+  projectSettings: Record<string, unknown>
   roster: object[] | 'fail'
   rosterCalls: number
   sessionId: string
@@ -244,6 +276,7 @@ function world(on: any, opts: { files?: Record<string, string>; send?: SendReply
     files: new Map(Object.entries(opts.files ?? { [`${DIR}/shop.json`]: mission({ nodes: NODES }) })),
     links: new Map(),
     userSettings: {},
+    projectSettings: {},
     roster: opts.roster ?? ROSTER,
     rosterCalls: 0,
     sessionId: SELF_ID,
@@ -262,7 +295,7 @@ function world(on: any, opts: { files?: Record<string, string>; send?: SendReply
     return p
   }
   on('env.get', (_$: any, e: any) => value(e.name === 'HOME' ? HOME : undefined))
-  on('settings.read', () => value(w.userSettings))
+  on('settings.read', (_$: any, e: any) => value(e?.source === 'user' ? w.userSettings : w.projectSettings))
   on('session.root', () => value(ROOT))
   on('session.cwd', () => value(ROOT))
   on('session.id', () => value(w.sessionId))
@@ -458,6 +491,39 @@ describe('啟用判定', () => {
   })
 })
 
+describe('mission 目錄沿用 dispatch-board 的設定', () => {
+  const at = (dir: string) => ({ [`${HOME}/${dir}/shop.json`]: mission({ nodes: NODES }) })
+  const cfg = (o: Record<string, string>) => ({ pluginConfigs: Object.fromEntries(Object.entries(o).map(([k, v]) => [k, { options: { missions_dir: v } }])) })
+
+  test('只有 dispatch-board 鍵：讀 board 的目錄', async ($: any, on: any) => {
+    const w = world(on, { files: at('boarddir') })
+    w.dirs.add(`${HOME}/boarddir`)
+    w.userSettings = cfg({ 'dispatch-board@learning-hacker-claude-mod': '~/boarddir' })
+    await start($, on)
+    expect(await composeIds($)).toEqual(['dispatch-relay:relay'])
+  })
+
+  test('兩鍵並存且不同：以 dispatch-relay 自己的為準', { options: { missions_dir: '~/relaydir' } }, async ($: any, on: any) => {
+    const w = world(on, { files: { ...at('relaydir'), [`${HOME}/boarddir/blog.json`]: JSON.stringify({ mission_id: 'blog', station: 'x', nodes: [{ id: 'b', session: 'shop-api' }] }) } })
+    w.dirs.add(`${HOME}/relaydir`)
+    w.dirs.add(`${HOME}/boarddir`)
+    w.userSettings = cfg({ 'dispatch-relay@learning-hacker-claude-mod': '~/relaydir', 'dispatch-board@learning-hacker-claude-mod': '~/boarddir' })
+    await start($, on)
+    expect(await composeIds($)).toEqual(['dispatch-relay:relay'])
+    expect(w.logs.some(l => l.includes('已啟用：mission shop'))).toBe(true)
+  })
+
+  test('安全：dispatch-board 鍵只寫在專案設定 → 不採用，仍讀預設目錄', async ($: any, on: any) => {
+    const w = world(on, { files: at('boarddir') })
+    w.dirs.add(`${HOME}/boarddir`)
+    w.projectSettings = cfg({ 'dispatch-board': '~/boarddir' })
+    await start($, on)
+    await submit($)
+    await expectInert($, w)
+    expect(w.rosterCalls).toBe(0)
+  })
+})
+
 describe('turn.complete 轉送', () => {
   test('首次寫入：送給名冊解析出的指揮站 session id，畫面一行，store 記為已處理', async ($: any, on: any) => {
     const w = world(on, { files: { [`${DIR}/shop.json`]: mission({ nodes: NODES }), [RESULT]: '# 回報\n' } })
@@ -524,6 +590,18 @@ describe('turn.complete 轉送', () => {
     expect(w.sends[1]!.to).toContain(STATION_ID_2)
   })
 
+  test('啟用後 mission 拿掉 station：停用訊息說「找到節點但沒有 station」，不是「沒有指派」', async ($: any, on: any) => {
+    const w = world(on, { files: { [`${DIR}/shop.json`]: mission({ nodes: NODES }) } })
+    await start($, on)
+    w.files.set(`${DIR}/shop.json`, JSON.stringify({ mission_id: 'shop', nodes: NODES }))
+    await runTurn($, '還有一句')
+    expect(w.sends).toEqual([])
+    const line = w.logs.find(l => l.includes('停用')) ?? ''
+    expect(line).toContain('找到指派給本 session 的節點 shop/api')
+    expect(line).toContain('沒有 station')
+    expect(line).not.toContain('沒有指派給本 session')
+  })
+
   test('mission 檔搬走（收斂）後停用：不送、不再注入', async ($: any, on: any) => {
     const w = world(on, { files: { [`${DIR}/shop.json`]: mission({ nodes: NODES }) } })
     await start($, on)
@@ -570,7 +648,7 @@ describe('降級', () => {
     w.files.set(RESULT, 'A\nB\n')
     await runTurn($, '二')
     expect(w.prompts.length).toBe(1)
-    expect(w.prompts[0]).toContain(`上次成功送達指揮站時使用的位址是 ${modTo}`)
+    expect(w.prompts[0]).toContain(`改用上次成功送達指揮站時使用的位址 ${modTo}`)
     const text = await runTurn($, '我只回覆文字')
     expect(w.prompts.length).toBe(1)
     expect(text).toContain('再度失敗')
