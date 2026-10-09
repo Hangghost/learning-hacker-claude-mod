@@ -10,7 +10,9 @@ export type Identity = { missionId: string; nodeId: string; station: string; res
 /**
  * 身份判定的結果。
  * - match：恰好一個節點的 `session` 是本 session 的名稱，且該 mission 有 `station`
- * - none：沒有節點指派給本 session（含名冊上查無本 session）
+ * - no-missions：mission 目錄不存在或沒有可讀的 mission 檔
+ * - no-relay：沒有任何 mission 寫 station（不讀名冊就能確定不啟用）
+ * - none：有選用 relay 的 mission，但沒有節點指派給本 session（`name` 是本 session 的名稱）
  * - ambiguous：多個節點都指派給本 session
  * - no-station：唯一匹配，但 mission 沒有 `station`（沒有選用 relay）
  * - self-station：唯一匹配，但 `station` 就是本 session
@@ -18,7 +20,9 @@ export type Identity = { missionId: string; nodeId: string; station: string; res
  */
 export type Resolution =
   | { kind: 'match'; identity: Identity }
-  | { kind: 'none' }
+  | { kind: 'no-missions' }
+  | { kind: 'no-relay' }
+  | { kind: 'none'; name: string }
   | { kind: 'ambiguous'; candidates: string[] }
   | { kind: 'no-station'; missionId: string; nodeId: string }
   | { kind: 'self-station'; missionId: string; nodeId: string }

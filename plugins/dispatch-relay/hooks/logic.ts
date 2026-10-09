@@ -81,15 +81,40 @@ export function dirRefusal(f: DirFacts): string | null {
  */
 export function configRefusal(configured: string, userSettings: Readonly<Record<string, unknown>>): string | null {
   if (configured.trim() === DEFAULT_DIR) return null
-  const configs = userSettings.pluginConfigs
-  if (configs && typeof configs === 'object') {
-    for (const [key, entry] of Object.entries(configs as Record<string, unknown>)) {
-      if (key !== PLUGIN && !key.startsWith(`${PLUGIN}@`)) continue
-      const options = (entry as { options?: Record<string, unknown> } | null)?.options
-      if (options && options.missions_dir === configured) return null
-    }
-  }
+  if (userDirOption(userSettings, PLUGIN) === configured) return null
   return 'missions_dir 只接受使用者層級設定（~/.claude/settings.json）；其他來源的值不採用'
+}
+
+export const BOARD_PLUGIN = 'dispatch-board'
+
+/** 使用者層級設定裡某個 plugin（`<name>` 或 `<name>@<marketplace>`）的 missions_dir；沒設回 undefined。 */
+export function userDirOption(userSettings: Readonly<Record<string, unknown>>, plugin: string): string | undefined {
+  const configs = userSettings.pluginConfigs
+  if (!configs || typeof configs !== 'object') return undefined
+  for (const [key, entry] of Object.entries(configs as Record<string, unknown>)) {
+    if (key !== plugin && !key.startsWith(`${plugin}@`)) continue
+    const v = (entry as { options?: Record<string, unknown> } | null)?.options?.missions_dir
+    if (typeof v === 'string' && v.trim()) return v
+  }
+  return undefined
+}
+
+/**
+ * 要用的 mission 目錄設定。優先序：本 mod 自己的 missions_dir → dispatch-board 的 missions_dir → 預設。
+ * 兩者都只認使用者層級設定：`configured` 是引擎給本 mod 的值（可能來自專案設定，所以非預設值要過 configRefusal）；
+ * dispatch-board 的值直接從 `userSettings`（只讀 ~/.claude/settings.json）取，專案設定裡的 board 鍵看不到、不採用。
+ * 自訂目錄因此只要在 dispatch-board 設一次；沒裝 dispatch-board（設定裡沒有它的鍵）時行為不變。
+ */
+export function pickDir(
+  configured: string,
+  userSettings: Readonly<Record<string, unknown>>,
+): { ok: true; dir: string } | { ok: false; error: string } {
+  if (configured.trim() !== DEFAULT_DIR) {
+    const refused = configRefusal(configured, userSettings)
+    return refused ? { ok: false, error: refused } : { ok: true, dir: configured }
+  }
+  if (userDirOption(userSettings, PLUGIN) !== undefined) return { ok: true, dir: DEFAULT_DIR }
+  return { ok: true, dir: userDirOption(userSettings, BOARD_PLUGIN) ?? DEFAULT_DIR }
 }
 
 /** mission 檔候選：目錄第一層的 `*.json`（子目錄不讀，`done/` 可放收斂完的檔） */
@@ -221,11 +246,11 @@ export function resolveStation(
  * 別人的結果檔送出去。對到的 mission 沒有 `station`＝沒有選用 relay，同樣不啟用。
  */
 export function findIdentity(missions: readonly RelayMission[], name: string): Resolution {
-  if (!name) return { kind: 'none' }
+  if (!name) return { kind: 'none', name }
   const key = normalizeName(name)
   const hits: { m: RelayMission; n: RelayNode }[] = []
   for (const m of missions) for (const n of m.nodes) if (n.session && normalizeName(n.session) === key) hits.push({ m, n })
-  if (hits.length === 0) return { kind: 'none' }
+  if (hits.length === 0) return { kind: 'none', name }
   if (hits.length > 1) return { kind: 'ambiguous', candidates: hits.map(h => `${h.m.missionId}/${h.n.id}`) }
   const { m, n } = hits[0] as { m: RelayMission; n: RelayNode }
   if (!m.station) return { kind: 'no-station', missionId: m.missionId, nodeId: n.id }
@@ -238,12 +263,16 @@ export function inactiveLog(r: Exclude<Resolution, { kind: 'match' }>): string {
   switch (r.kind) {
     case 'unavailable':
       return `未啟用：${r.reason}`
+    case 'no-missions':
+      return '未啟用：mission 目錄不存在或沒有可讀的 mission 檔'
+    case 'no-relay':
+      return '未啟用：mission 目錄裡沒有任何 mission 寫 station（沒有選用 dispatch-relay）'
     case 'none':
-      return '未啟用：mission 目錄裡沒有指派給本 session 的節點'
+      return `未啟用：mission 目錄裡沒有指派給本 session${r.name ? `（${r.name}）` : ''}的節點`
     case 'ambiguous':
       return `未啟用：多重匹配，候選 ${r.candidates.join('、')}，不任選其一`
     case 'no-station':
-      return `未啟用：mission ${r.missionId} 沒有 station 欄位（沒有選用 dispatch-relay），節點 ${r.nodeId} 照原本方式回報`
+      return `未啟用：找到指派給本 session 的節點 ${r.missionId}/${r.nodeId}，但該 mission 沒有 station 欄位（沒有選用 dispatch-relay），照原本方式回報`
     case 'self-station':
       return `未啟用：mission ${r.missionId} 的 station 就是本 session，不轉送給自己`
   }
@@ -369,7 +398,8 @@ export type DegradeAddress = { station: string; lastDelivered?: string }
 
 /**
  * 降級 prompt：載明失敗原因；要求 worker 自己 SendMessage 全文；不要求落成另一個檔案；告訴 worker 送去哪裡。
- * 位址依可靠度排序：指揮站最近一則訊息的 `from` 位址 → 上次成功送達時的位址 → mission 檔的 station 名稱。
+ * 位址依可靠度排序：mission 檔的 station 名稱 → 上次成功送達時的位址 → 最近一則來訊的 `from` 位址（僅當來自指揮站）。
+ * from 放最後：worker 可能收過其他 session 的訊息，「最近一則」不一定是指揮站，回錯人會把回報送給第三方。
  * 各位址候選各占一行，model 不必從連成一串的句子裡切出位址。
  */
 export function degradePrompt(built: Built, reason: string, resultFile: string, addr: DegradeAddress): string {
@@ -381,12 +411,14 @@ export function degradePrompt(built: Built, reason: string, resultFile: string, 
   const lines = [
     `dispatch-relay 沒能把回報轉送給指揮站（${reason}）。`,
     `請改用 SendMessage，把${what.join('與')}原文放進訊息本體送給指揮站。`,
-    '收件者：回覆指揮站最近一則送給你的訊息的 from 位址（該則 <cross-session-message> 的 from 屬性）。',
+    `收件者：${addr.station}（mission 檔記錄的指揮站名稱，SendMessage 的 to 直接填這個名稱）。`,
   ]
   if (addr.lastDelivered) {
-    lines.push(`上次成功送達指揮站時使用的位址是 ${addr.lastDelivered}（指揮站若已重開可能失效，以 from 位址為優先）。`)
+    lines.push(`名稱送不到時，改用上次成功送達指揮站時使用的位址 ${addr.lastDelivered}（指揮站若已重開可能失效）。`)
   }
-  lines.push(`沒有 from 位址時，mission 檔記錄的指揮站名稱是 ${addr.station}（名稱有重複時無法送達）。`)
+  lines.push(
+    `以上都送不到時，才回覆最近一則送給你的訊息的 from 位址——僅當該則來自指揮站 ${addr.station}；來自其他 session 的訊息不算，不要回給它。`,
+  )
   lines.push('不要為此另外寫檔。')
   return lines.join('\n')
 }

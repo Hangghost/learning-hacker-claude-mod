@@ -61,6 +61,8 @@ mission 檔格式與範例見 [plugins/dispatch-board/README.md](plugins/dispatc
 - 身份判定：本 session 的 id → `claude agents --json` 查出名稱 → mission 檔裡恰好一個節點指派給這個名稱才啟用
 - 只送有變更的內容（追加時只送追加段）；送不到時請 worker 自己 `SendMessage`，同一份內容只請一次
 
+前提：指揮站與 worker 都要用 `--name` 開，名稱與 `claude agents` 一致；新目錄第一次 `claude --bg` 前先在該目錄跑一次 `claude` 接受信任（否則回 `Workspace not trusted…`）；用 `--worktree <名>` 開的 worker，`result_file` 相對的是 `<repo>/.claude/worktrees/<名>`。自訂 mission 目錄只要在 dispatch-board 設一次，relay 會沿用。
+
 **安全邊界**：mod 會把檔案內容送到另一個 session。它只送對到的節點的結果檔（必須在 worker 的專案根目錄底下，解析符號連結後也一樣）與最終回覆，只送給名冊上**恰好一筆**對到 `station` 的 session；mission 檔的讀取規則與 dispatch-board 相同。`tool.check` 只放行它自己發出的送件。
 
 細節見 [plugins/dispatch-relay/README.md](plugins/dispatch-relay/README.md)。
