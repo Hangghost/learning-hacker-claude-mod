@@ -17,6 +17,11 @@
       "description": "多個 Claude Code session 分工時的派工看板：讀你寫的 mission 檔，顯示誰完成、誰在跑、誰在等你，狀態轉換時跳 toast"
     },
     {
+      "name": "dispatch-relay",
+      "source": "./plugins/dispatch-relay",
+      "description": "dispatch-board 的搭檔：worker 把回報寫進結果檔後以一行結束，由 mod 在 turn 結束時把新增內容與最終回覆轉送給指揮站（mission 檔寫了 station 才啟用）"
+    },
+    {
       "name": "handoff-runner",
       "source": "./plugins/handoff-runner",
       "description": "bg session 在 worktree 做完的分支，由你在面板按一顆按鈕快轉進 main：交接單只帶參數，執行前檢查、執行後驗證"
