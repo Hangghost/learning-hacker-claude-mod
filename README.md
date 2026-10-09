@@ -9,6 +9,7 @@ Learning Hacker 的 [Claude Code mods](https://code.claude.com/docs/en/plugins/m
 | mod | 做什麼 | 版本 |
 |---|---|---|
 | [`dispatch-board`](plugins/dispatch-board) | 多個 session 分工時的派工看板：讀你寫的 mission 檔，顯示誰完成、誰在跑、誰在等你，狀態轉換時跳 toast | 0.1.0 |
+| [`dispatch-relay`](plugins/dispatch-relay) | dispatch-board 的搭檔：worker 把回報寫進結果檔後以一行結束，由 mod 在 turn 結束時轉送給指揮站 | 0.1.0 |
 | [`handoff-runner`](plugins/handoff-runner) | bg session 在 worktree 做完的分支，由你在面板按一顆按鈕快轉進 main，執行前檢查、執行後驗證 | 0.1.0 |
 | [`working-memory`](plugins/working-memory) | 把 context window 畫成一顆腦：工具呼叫點亮對應腦區，用量越滿越擁擠，compact 時睡眠整理 | 0.1.0 |
 
@@ -28,9 +29,12 @@ Learning Hacker 的 [Claude Code mods](https://code.claude.com/docs/en/plugins/m
 
 ```
 /plugin install dispatch-board@learning-hacker-claude-mod
+/plugin install dispatch-relay@learning-hacker-claude-mod
 /plugin install handoff-runner@learning-hacker-claude-mod
 /plugin install working-memory@learning-hacker-claude-mod
 ```
+
+dispatch-relay 需要 v2.1.289 以上。
 
 在 shell 裡用 `claude plugin marketplace add …`、`claude plugin install …` 也可以。已開著的 session 執行 `/reload-plugins` 載入。
 
@@ -48,6 +52,18 @@ Learning Hacker 的 [Claude Code mods](https://code.claude.com/docs/en/plugins/m
 **安全邊界**：完成條件是 shell 指令，mod 會執行它，所以 mission 檔**只從使用者層級的目錄讀**（預設 `~/.claude/missions/`），不讀任何專案目錄或 repo 內的檔案，也不接受專案設定改掉這個目錄。clone 一個陌生 repo 不會讓 mod 執行對方寫的指令。
 
 mission 檔格式與範例見 [plugins/dispatch-board/README.md](plugins/dispatch-board/README.md)。
+
+## dispatch-relay：worker 的回報自動送到指揮站
+
+分工時 worker 做完要自己 `SendMessage` 把回報全文送給指揮站，同一份回報等於生成兩次，送完還要多跑一次收尾。dispatch-relay 裝在 worker 那一側：worker 把回報寫進結果檔、以一行結束 turn，mod 在 turn 結束時把新增的內容和最終回覆原文送給指揮站。
+
+- 在 dispatch-board 的 mission 檔加上 `station`（指揮站的 session 名稱）才啟用；沒寫的 mission 不受影響
+- 身份判定：本 session 的 id → `claude agents --json` 查出名稱 → mission 檔裡恰好一個節點指派給這個名稱才啟用
+- 只送有變更的內容（追加時只送追加段）；送不到時請 worker 自己 `SendMessage`，同一份內容只請一次
+
+**安全邊界**：mod 會把檔案內容送到另一個 session。它只送對到的節點的結果檔（必須在 worker 的專案根目錄底下，解析符號連結後也一樣）與最終回覆，只送給名冊上**恰好一筆**對到 `station` 的 session；mission 檔的讀取規則與 dispatch-board 相同。`tool.check` 只放行它自己發出的送件。
+
+細節見 [plugins/dispatch-relay/README.md](plugins/dispatch-relay/README.md)。
 
 ## handoff-runner：一鍵把 worktree 分支落地
 
@@ -97,6 +113,18 @@ calls: $.clock.every, $.clock.now, $.command.register, $.env.get, $.fs.exists, $
 
 `$.process.run` 只用來跑你 mission 檔裡的完成條件（`/bin/sh -c`，每條 5 秒逾時）和 `claude agents --json`；檔案只讀不寫；不連網、不呼叫模型、不送 prompt。
 
+**dispatch-relay**
+
+```
+hooks: session.start, prompt.submit, prompt.compose, turn.start, tool.call{tool=SendMessage},
+       session.send, tool.check{tool=SendMessage}, turn.complete
+calls: $.env.get, $.fs.exists, $.fs.list, $.fs.read, $.fs.stat, $.process.run, $.prompt.submit,
+       $.session.cwd, $.session.id, $.session.root, $.session.send, $.settings.read,
+       $.store.delete, $.store.get, $.store.set, $.ui.log
+```
+
+`$.process.run` 只跑 `claude agents --json`；`$.session.send` 只送給 mission 檔 `station` 對到的那一個 session；`$.prompt.submit` 只在送不到時請 worker 自己送；檔案只讀不寫；不連網、不呼叫模型。
+
 **handoff-runner**
 
 ```
@@ -138,13 +166,15 @@ A collection of Claude Code mods by Learning Hacker. Shared as-is, without suppo
 ```
 /plugin marketplace add Hangghost/learning-hacker-claude-mod
 /plugin install dispatch-board@learning-hacker-claude-mod
+/plugin install dispatch-relay@learning-hacker-claude-mod
 /plugin install handoff-runner@learning-hacker-claude-mod
 /plugin install working-memory@learning-hacker-claude-mod
 ```
 
-Requires Claude Code v2.1.287+.
+Requires Claude Code v2.1.287+ (dispatch-relay: v2.1.289+).
 
 - **dispatch-board**: a board for running several Claude Code sessions in parallel. Reads mission files you write (nodes, the session responsible, a shell command that exits 0 when done) and shows who is done, who is running and who is waiting on you. Mission files are read only from a user-level directory (default `~/.claude/missions/`), never from a project, so cloning a repo cannot make it run someone else's commands.
+- **dispatch-relay**: the worker-side companion to dispatch-board. A worker writes its report to a result file and ends the turn with one line; the mod forwards what changed, plus the final reply, to the commanding session named by the mission's `station` field (opt-in per mission). It sends only the matched node's result file, kept inside the worker's project root, and only to the one roster session matching `station`.
 - **handoff-runner**: lets a background session that finished a branch in its own worktree issue a handoff ticket, which you land into `main` with one button. Tickets carry only parameters (branch, target, pinned commit); the git steps are derived by the mod, checked before running and verified after. Push is off by default.
 - **working-memory**: draws your context window as a brain. Tool calls light up regions, the brain fills up as context grows, and compaction plays a "sleep" sweep.
 

@@ -1,0 +1,15 @@
+{
+  "name": "dispatch-relay",
+  "version": "0.1.0",
+  "description": "dispatch-board 的搭檔：worker session 把回報寫進結果檔後以一行結束，由 mod 在 turn 結束時把新增內容與最終回覆轉送給指揮站（mission 檔寫了 station 才啟用；需 Claude Code ≥ 2.1.289）",
+  "author": { "name": "Hangghost", "url": "https://github.com/Hangghost" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "missions_dir": {
+      "type": "string",
+      "title": "mission 目錄",
+      "description": "放 mission 檔（*.json）的目錄，須為 ~/… 或絕對路徑，且在家目錄底下、不在任何 git repo 內。自訂值只認 ~/.claude/settings.json 裡的設定；和 dispatch-board 一起用時兩邊設成同一個目錄。",
+      "default": "~/.claude/missions"
+    }
+  }
+}
