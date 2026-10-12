@@ -3,9 +3,13 @@
 // 測試的 `on` 位於所有 plugin 之下、扮演引擎：檔案系統（mission 目錄與結果檔）、設定、session id、
 // `claude agents --json` 名冊由這裡假造，`session.send` 與本 mod 排入的 prompt 記錄下來。mod 不寫檔，所以沒有 fs.write。
 
-import { describe, expect, test } from 'claude-code/testing'
+import { describe, expect, mock, test } from 'claude-code/testing'
 
 import {
+  HOLD_LIMIT_MS,
+  WAKE_TEXT,
+  bgEntryOf,
+  bgSettle,
   buildMessage,
   checkResultFile,
   classifyRecipient,
@@ -16,11 +20,15 @@ import {
   findIdentity,
   inactiveLog,
   injectionText,
+  mergeHeld,
+  parseHeld,
   parseMission,
   parseRoster,
   pickDir,
   resolveStation,
+  resultChanged,
   sendCheckVerdict,
+  shouldHold,
   submitFailure,
   trySubmit,
 } from '../hooks/logic'
@@ -264,13 +272,31 @@ type World = {
   logs: string[]
   store: Map<string, unknown>
   storeAtPrompt: Record<string, unknown>[]
+  /** 各工具 tool.call 的 result；未列者回 `{ ok: true }` */
+  toolResults: Record<string, unknown>
 }
 
 function parentOf(p: string): string {
   return p.slice(0, p.lastIndexOf('/')) || '/'
 }
 
-function world(on: any, opts: { files?: Record<string, string>; send?: SendReply[]; submit?: SubmitReply[]; roster?: object[] | 'fail' } = {}): World {
+function world(
+  on: any,
+  opts: {
+    files?: Record<string, string>
+    send?: SendReply[]
+    submit?: SubmitReply[]
+    roster?: object[] | 'fail'
+    store?: Record<string, unknown>
+    /** store 寫入（set／delete）只有前 N 次成功，之後一律拒絕；未設＝永遠成功 */
+    storeWritesOk?: number
+  } = {},
+): World {
+  let storeWrites = 0
+  const storeWriteDenied = () => {
+    storeWrites += 1
+    return opts.storeWritesOk !== undefined && storeWrites > opts.storeWritesOk
+  }
   const w: World = {
     dirs: new Set([HOME, `${HOME}/.claude`, DIR, `${HOME}/code`, ROOT]),
     files: new Map(Object.entries(opts.files ?? { [`${DIR}/shop.json`]: mission({ nodes: NODES }) })),
@@ -286,8 +312,9 @@ function world(on: any, opts: { files?: Record<string, string>; send?: SendReply
     prompts: [],
     submitReplies: opts.submit ?? ['ok'],
     logs: [],
-    store: new Map(),
+    store: new Map(Object.entries(opts.store ?? {})),
     storeAtPrompt: [],
+    toolResults: {},
   }
   const value = (v: unknown) => ({ value: v })
   const real = (p: string) => {
@@ -339,13 +366,16 @@ function world(on: any, opts: { files?: Record<string, string>; send?: SendReply
   })
   on('store.get', (_$: any, e: any) => value(w.store.get(e.key)))
   on('store.set', (_$: any, e: any) => {
+    if (storeWriteDenied()) return { deny: 'store write failed' }
     w.store.set(e.key, e.value)
     return value(undefined)
   })
   on('store.delete', (_$: any, e: any) => {
+    if (storeWriteDenied()) return { deny: 'store write failed' }
     w.store.delete(e.key)
     return value(undefined)
   })
+  on('session.end', (_$: any, e: any) => ({ sessionId: String(e.sessionId) }))
   on('prompt.submit', (_$: any, e: any) => {
     if (e.origin?.kind === 'plugin') {
       w.prompts.push(String(e.text))
@@ -358,7 +388,7 @@ function world(on: any, opts: { files?: Record<string, string>; send?: SendReply
   on('prompt.compose', () => ({ sections: [] }))
   on('turn.start', (_$: any, e: any) => ({ turnId: e.turnId }))
   on('turn.complete', (_$: any, e: any) => ({ text: String(e.answer) }))
-  on('tool.call', () => ({ result: { ok: true } }))
+  on('tool.call', (_$: any, e: any) => ({ result: w.toolResults[String(e.tool)] ?? { ok: true } }))
   on('tool.check', () => ({ decision: 'ask' }))
   return w
 }
@@ -369,13 +399,18 @@ async function start($: any, on: any): Promise<void> {
 }
 
 let turnN = 0
-async function runTurn($: any, answer: string, opts: { reason?: string; agentId?: string; selfSend?: boolean } = {}): Promise<string> {
+async function runTurn(
+  $: any,
+  answer: string,
+  opts: { reason?: string; agentId?: string; selfSend?: boolean; calls?: Record<string, unknown>[] } = {},
+): Promise<string> {
   turnN += 1
   const turnId = `t${turnN}`
   await $.turn.start({ text: 'go', turnId })
   if (opts.selfSend) {
     await $.tool.call({ tool: 'SendMessage', input: { to: 'shop-lead', message: 'x' }, tool_use_id: `u${turnN}` } as any)
   }
+  for (const [i, call] of (opts.calls ?? []).entries()) await $.tool.call({ ...call, tool_use_id: `c${turnN}-${i}` } as any)
   const r: any = await $.turn.complete({
     answer,
     durationMs: 1,
@@ -687,5 +722,411 @@ describe('tool.check', () => {
     expect(r.decision).toBe('ask')
     const c: any = await $.tool.call({ tool: 'SendMessage', input: { to: 'shop-lead', message: '問題' }, tool_use_id: 'u2' } as any)
     expect(c.result).toEqual({ ok: true })
+  })
+})
+
+// ── 暫存的等待中回覆與時限叫醒 ──────────────────────────────────────────────
+
+describe('logic：暫存與背景工作帳', () => {
+  test('buildMessage：held-reply 排在結果檔之後、最終回覆之前，自送時仍帶出', async () => {
+    const all = buildMessage(IDS, undefined, '回報', '好了', false, '先前等待中')
+    expect(all.parts).toEqual(['result-full', 'held-reply', 'final-reply'])
+    expect(all.chars).toBe('回報'.length + '先前等待中'.length + '好了'.length)
+    expect(all.text).toContain('--- held-reply ---\n先前等待中')
+    const self = buildMessage(IDS, 'x', 'x', '收尾', true, '先前等待中')
+    expect(self.parts).toEqual(['held-reply'])
+    expect(self.nextSent).toBeNull()
+    expect(buildMessage(IDS, 'x', 'x', '', false, '  ').parts).toEqual([])
+  })
+
+  test('resultChanged：缺席、空白、相同都不算變更', async () => {
+    expect(resultChanged(undefined, null)).toBe(false)
+    expect(resultChanged('a', 'a')).toBe(false)
+    expect(resultChanged(undefined, ' \n')).toBe(false)
+    expect(resultChanged(undefined, 'a')).toBe(true)
+    expect(resultChanged('a', 'ab')).toBe(true)
+  })
+
+  test('shouldHold：帳上有工作、非叫醒、未自送、結果檔未變、回覆非空才暫存', async () => {
+    const base = { answer: '等待中', resultChanged: false, selfSent: false, pending: 1, mustFlush: false }
+    expect(shouldHold(base)).toBe(true)
+    expect(shouldHold({ ...base, pending: 0 })).toBe(false)
+    expect(shouldHold({ ...base, mustFlush: true })).toBe(false)
+    expect(shouldHold({ ...base, selfSent: true })).toBe(false)
+    expect(shouldHold({ ...base, resultChanged: true })).toBe(false)
+    expect(shouldHold({ ...base, answer: ' ' })).toBe(false)
+  })
+
+  test('mergeHeld／parseHeld：連續暫存以空行串接，起算時間沿用第一則；壞資料視為沒有暫存', async () => {
+    const a = mergeHeld(null, ' 一 ', 100)
+    expect(a).toEqual({ text: '一', since: 100 })
+    expect(mergeHeld(a, '二', 900)).toEqual({ text: '一\n\n二', since: 100 })
+    expect(parseHeld(a)).toEqual(a)
+    for (const bad of [null, 'x', {}, { text: '', since: 1 }, { text: 'a', since: '1' }]) expect(parseHeld(bad)).toBeNull()
+  })
+
+  test('bgEntryOf：Bash／Monitor／背景 Agent 取 id，排程取 prompt 原文；前景與隨回覆終止的不登', async () => {
+    expect(bgEntryOf('Bash', {}, { backgroundTaskId: 'b1' })).toEqual({ id: 'b1' })
+    expect(bgEntryOf('Bash', {}, { backgroundTaskId: 'b1', backgroundEndsWithFinalResponse: true })).toBeNull()
+    expect(bgEntryOf('Bash', {}, { stdout: 'x' })).toBeNull()
+    expect(bgEntryOf('Monitor', {}, { taskId: 'm1' })).toEqual({ id: 'm1' })
+    expect(bgEntryOf('Agent', {}, { isAsync: true, agentId: 'a1' })).toEqual({ id: 'a1' })
+    expect(bgEntryOf('Agent', {}, { agentId: 'a1' })).toBeNull()
+    expect(bgEntryOf('ScheduleWakeup', { prompt: 'check' }, { scheduledFor: 1 })).toEqual({ text: 'check' })
+    expect(bgEntryOf('CronCreate', { input: { prompt: 'tick' } }, { id: 'c1' })).toEqual({ text: 'tick' })
+    expect(bgEntryOf('TaskStop', {}, { ok: true })).toBeNull()
+    expect(bgEntryOf('Bash', {}, undefined)).toBeNull()
+  })
+
+  test('bgSettle：status 才銷；event 不銷；對不上 id 不銷；無 id 只銷同類最舊；peer 與排程各依規則', async () => {
+    const ledger = [{ id: 'b1' }, { text: 'check' }, { id: 'b2' }]
+    const done = (id: string) => `<task-id>${id}</task-id><status>completed</status>`
+    expect(bgSettle(ledger, 'task-notification', done('b1'))).toEqual([{ text: 'check' }, { id: 'b2' }])
+    expect(bgSettle(ledger, 'task-notification', '<task-id>b1</task-id><event>x</event>')).toEqual(ledger)
+    expect(bgSettle(ledger, 'task-notification', done('zzz'))).toEqual(ledger)
+    expect(bgSettle(ledger, 'task-notification', '完成了')).toEqual([{ text: 'check' }, { id: 'b2' }])
+    expect(bgSettle(ledger, 'peer', '<agent-message from="b2">done</agent-message>')).toEqual([{ id: 'b1' }, { text: 'check' }])
+    expect(bgSettle(ledger, 'peer', '<cross-session-message from="uds:/x">hi</cross-session-message>')).toEqual(ledger)
+    expect(bgSettle(ledger, 'scheduled-trigger', 'check')).toEqual([{ id: 'b1' }, { id: 'b2' }])
+    expect(bgSettle(ledger, 'scheduled-trigger', '別的')).toEqual([{ id: 'b1' }, { id: 'b2' }])
+    expect(bgSettle(ledger, 'sdk', 'x')).toEqual(ledger)
+  })
+
+  test('degradeFailedLine／degradePrompt／injectionText 涵蓋 held-reply', async () => {
+    expect(degradeFailedLine('x', 'y', { result: 'none', finalReply: false, heldReply: true })).toContain('暫存的等待中回覆不會重送')
+    const built = buildMessage(IDS, undefined, null, '', true, '暫存')
+    expect(degradePrompt(built, 'gone', 'r.md', { station: 'shop-lead' })).toContain('先前暫存的等待中回覆')
+    const t = injectionText({ missionId: 'shop', nodeId: 'api', station: 'shop-lead', resultFile: 'r.md' })
+    expect(t).toContain('暫存')
+    expect(t).toContain('自送不受延後')
+  })
+})
+
+describe('暫存的等待中回覆與時限叫醒', () => {
+  const HELD = `relay:held:${ROOT}`
+  const BASH_BG = { tool: 'Bash', command: 'make test', run_in_background: true }
+  const done = (id: string) => `<task-notification>\n<task-id>${id}</task-id>\n<status>completed</status>\n</task-notification>`
+  const notify = ($: any, text: string, kind = 'task-notification') => $.prompt.submit({ text, wait: false, origin: { kind } } as any)
+  const FAIL = { isDelivered: false as const, reason: 'no live session' }
+  const DROP: SubmitReply = { drop: 'blocked' }
+  const head = (text: string) => text.split('\n')[0]!
+
+  /** 啟用並在一個 turn 內起背景 Bash、以「等待中」結束 turn（暫存）。 */
+  async function holdFirst($: any, on: any, opts: Parameters<typeof world>[1] = {}, answer = '等待全套測試結果中。') {
+    const w = world(on, opts)
+    const clock = mock.clock(on)
+    w.toolResults.Bash = { backgroundTaskId: 'bt1' }
+    await start($, on)
+    await submit($)
+    const text = await runTurn($, answer, { calls: [BASH_BG] })
+    return { w, clock, text }
+  }
+
+  test('等待背景測試的 turn 不單獨送出：暫存、畫面載明、不改寫工具呼叫的結果', async ($: any, on: any) => {
+    const { w, text } = await holdFirst($, on)
+    expect(w.sends).toEqual([])
+    expect(text).toContain('已暫存')
+    expect(w.store.get(HELD)).toEqual({ text: '等待全套測試結果中。', since: 0 })
+    const r: any = await $.tool.call({ ...BASH_BG, tool_use_id: 'x' } as any)
+    expect(r.result).toEqual({ backgroundTaskId: 'bt1' })
+  })
+
+  test('背景工作完成後的 turn 帶上暫存的回覆：result-full,held-reply,final-reply，暫存清空', async ($: any, on: any) => {
+    const { w } = await holdFirst($, on)
+    await notify($, done('bt1'))
+    w.files.set(RESULT, '# 回報\n全綠\n')
+    await runTurn($, '測試通過')
+    expect(w.sends.length).toBe(1)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=result-full,held-reply,final-reply chars=\d+$/)
+    expect(w.sends[0]!.text).toContain('--- held-reply ---\n等待全套測試結果中。')
+    expect(w.store.has(HELD)).toBe(false)
+  })
+
+  test('時限到時叫醒 worker：回呼內不送，叫醒 turn 的 turn.complete 送出 held-reply，且不附帶自己的「ok」', async ($: any, on: any) => {
+    const { w, clock } = await holdFirst($, on)
+    await clock.advance(HOLD_LIMIT_MS - 1)
+    expect(w.prompts).toEqual([])
+    await clock.advance(1)
+    expect(w.prompts).toEqual([WAKE_TEXT])
+    expect(w.sends).toEqual([]) // 回呼內 SHALL NOT 直接送
+    const text = await runTurn($, 'ok') // 叫醒 turn
+    expect(w.sends.length).toBe(1)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=held-reply chars=\d+$/)
+    expect(w.sends[0]!.text).toContain('等待全套測試結果中。')
+    expect(w.sends[0]!.text).not.toContain('--- final-reply ---')
+    expect(text).toContain('已送達指揮站 shop-lead')
+    expect(w.store.has(HELD)).toBe(false)
+  })
+
+  test('被叫醒的 turn 帳上仍有背景工作也無條件送出，不再暫存、不再叫醒', async ($: any, on: any) => {
+    const { w, clock } = await holdFirst($, on)
+    await clock.advance(HOLD_LIMIT_MS)
+    await runTurn($, '還在跑')
+    expect(w.sends.length).toBe(1)
+    expect(w.store.has(HELD)).toBe(false)
+    await clock.advance(HOLD_LIMIT_MS * 3)
+    expect(w.prompts.length).toBe(1)
+    // 叫醒旗標已消費：之後帳上仍有工作的 turn 恢復一般暫存
+    await runTurn($, '又在等')
+    expect(w.sends.length).toBe(1)
+    expect(w.store.has(HELD)).toBe(true)
+  })
+
+  test('連續等待不重設時限：兩則合併，第一則起算 10 分鐘內叫醒', async ($: any, on: any) => {
+    const { w, clock } = await holdFirst($, on, {}, '等待中一')
+    await clock.advance(6 * 60 * 1000)
+    await runTurn($, '等待中二')
+    expect(w.sends).toEqual([])
+    await clock.advance(4 * 60 * 1000 - 1)
+    expect(w.prompts).toEqual([])
+    await clock.advance(1)
+    expect(w.prompts).toEqual([WAKE_TEXT])
+    await runTurn($, 'ok')
+    expect(w.sends.length).toBe(1)
+    expect(w.sends[0]!.text).toContain('--- held-reply ---\n等待中一\n\n等待中二')
+  })
+
+  test('帳卡住只造成有上界的延後：完成通知始終未被辨識，每則仍在時限內送出', async ($: any, on: any) => {
+    const { w, clock } = await holdFirst($, on, {}, '進度一')
+    await notify($, '背景工作完成') // 取不到 task id → 銷最舊一筆背景工作
+    w.toolResults.Bash = { backgroundTaskId: 'bt2' }
+    await runTurn($, '進度二', { calls: [BASH_BG] })
+    await notify($, done('不是我的'))
+    await runTurn($, '進度三')
+    expect(w.sends).toEqual([])
+    await clock.advance(HOLD_LIMIT_MS)
+    expect(w.prompts.length).toBe(1)
+    await runTurn($, 'ok')
+    expect(w.sends.length).toBe(1)
+    for (const s of ['進度一', '進度二', '進度三']) expect(w.sends[0]!.text).toContain(s)
+  })
+
+  test('結果檔有變更時不暫存：result-append 與 final-reply 本 turn 送出', async ($: any, on: any) => {
+    const { w } = await holdFirst($, on, { files: { [`${DIR}/shop.json`]: mission({ nodes: NODES }), [RESULT]: 'A\n' } }, '等待中')
+    expect(w.sends.length).toBe(1)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=result-full,final-reply /)
+    expect(w.store.has(HELD)).toBe(false)
+    w.files.set(RESULT, 'A\nB\n')
+    await runTurn($, '又在等')
+    expect(w.sends.length).toBe(2)
+    expect(head(w.sends[1]!.text)).toMatch(/parts=result-append,final-reply /)
+  })
+
+  test('沒有背景工作時的單行提問立即送出', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    await start($, on)
+    await submit($)
+    await runTurn($, '要不要 push？')
+    expect(w.sends.length).toBe(1)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=final-reply /)
+    expect(w.store.has(HELD)).toBe(false)
+  })
+
+  test('worker 自送的 turn 仍帶出暫存的回覆，且不附帶該 turn 的最終回覆', async ($: any, on: any) => {
+    const { w } = await holdFirst($, on)
+    await runTurn($, '收尾說明', { selfSend: true })
+    expect(w.sends.length).toBe(1)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=held-reply /)
+    expect(w.sends[0]!.text).not.toContain('收尾說明')
+  })
+
+  test('時限到時 worker 正在 turn 中：不叫醒，該 turn 結束時無條件送出（即使帳上仍有背景工作）', async ($: any, on: any) => {
+    const { w, clock } = await holdFirst($, on)
+    await $.turn.start({ text: 'go', turnId: 'long' })
+    await clock.advance(HOLD_LIMIT_MS)
+    expect(w.prompts).toEqual([])
+    await $.turn.complete({ answer: '還在等', durationMs: 1, isAborted: false, turnId: 'long', reason: 'answer' } as any)
+    expect(w.sends.length).toBe(1)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=held-reply,final-reply /)
+    // 重確認的計時器已隨送出取消
+    await clock.advance(HOLD_LIMIT_MS)
+    expect(w.prompts).toEqual([])
+  })
+
+  test('時限到時 worker 在 turn 中、該 turn 未以答覆結束：60 秒重確認，閒置了才叫醒', async ($: any, on: any) => {
+    const { w, clock } = await holdFirst($, on)
+    await $.turn.start({ text: 'go', turnId: 'long' })
+    await clock.advance(HOLD_LIMIT_MS)
+    expect(w.prompts).toEqual([])
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 'long', reason: 'aborted' } as any)
+    expect(w.sends).toEqual([])
+    await clock.advance(60 * 1000 - 1)
+    expect(w.prompts).toEqual([])
+    await clock.advance(1)
+    expect(w.prompts).toEqual([WAKE_TEXT])
+    await runTurn($, 'ok')
+    expect(w.sends.length).toBe(1)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=held-reply /)
+  })
+
+  test('inTurn 被誤設（turn.start 之後沒有主迴圈 turn.complete）：重確認有次數上限，到上限直接叫醒', async ($: any, on: any) => {
+    const { w, clock } = await holdFirst($, on)
+    await $.turn.start({ text: 'go', turnId: 'stuck' })
+    await clock.advance(HOLD_LIMIT_MS + 5 * 60 * 1000 - 1)
+    expect(w.prompts).toEqual([])
+    await clock.advance(1)
+    expect(w.prompts).toEqual([WAKE_TEXT])
+    await clock.advance(HOLD_LIMIT_MS * 3)
+    expect(w.prompts.length).toBe(1)
+  })
+
+  test('叫醒的 prompt 被擋下：記日誌、不重新叫醒；暫存留到下一個答覆 turn 無條件送出', async ($: any, on: any) => {
+    const { w, clock } = await holdFirst($, on, { submit: [DROP] })
+    await clock.advance(HOLD_LIMIT_MS)
+    expect(w.prompts.length).toBe(1)
+    expect(w.logs.some(l => l.includes('叫醒 prompt 排入失敗') && l.includes('blocked'))).toBe(true)
+    await clock.advance(HOLD_LIMIT_MS * 3)
+    expect(w.prompts.length).toBe(1)
+    await runTurn($, '終於回來了')
+    expect(w.sends.length).toBe(1)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=held-reply,final-reply /)
+  })
+
+  test('叫醒 turn 沒有以答覆結束：不再叫醒，下一個答覆 turn 送出暫存', async ($: any, on: any) => {
+    const { w, clock } = await holdFirst($, on)
+    await clock.advance(HOLD_LIMIT_MS)
+    expect(w.prompts.length).toBe(1)
+    await runTurn($, '', { reason: 'error' })
+    expect(w.sends).toEqual([])
+    await clock.advance(HOLD_LIMIT_MS * 3)
+    expect(w.prompts.length).toBe(1)
+    await runTurn($, '好了')
+    expect(w.sends.length).toBe(1)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=held-reply,final-reply /)
+  })
+
+  test('熱重載不丟暫存：store 有暫存、模組狀態全新，依原起算時間排計時器', async ($: any, on: any) => {
+    const w = world(on, { store: { [HELD]: { text: '重載前暫存的回覆', since: 0 } } })
+    const clock = mock.clock(on, { now: 4 * 60 * 1000 })
+    await start($, on)
+    await clock.advance(6 * 60 * 1000 - 1)
+    expect(w.prompts).toEqual([])
+    await clock.advance(1)
+    expect(w.prompts).toEqual([WAKE_TEXT])
+    await runTurn($, 'ok')
+    expect(w.sends.length).toBe(1)
+    expect(w.sends[0]!.text).toContain('重載前暫存的回覆')
+  })
+
+  test('session.end 送出暫存的回覆（沿用啟用時解析到的指揮站 id，不再讀名冊）', async ($: any, on: any) => {
+    const { w } = await holdFirst($, on)
+    const before = w.rosterCalls
+    await $.session.end({ reason: 'other', sessionId: SELF_ID, resume: {} } as any)
+    expect(w.sends.length).toBe(1)
+    expect(w.sends[0]!.to).toContain(STATION_ID)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=held-reply /)
+    expect(w.rosterCalls).toBe(before)
+    expect(w.store.has(HELD)).toBe(false)
+  })
+
+  test('暫存回覆送件失敗且降級排入失敗：不重送，畫面載明，暫存已清空', async ($: any, on: any) => {
+    const { w } = await holdFirst($, on, { send: [FAIL], submit: [DROP] })
+    const text = await runTurn($, '收尾', { selfSend: true })
+    expect(text).toContain('暫存的等待中回覆不會重送')
+    expect(text).toContain('完成條件')
+    expect(w.store.has(HELD)).toBe(false)
+    expect(w.sends.length).toBe(1)
+    await runTurn($, '再一個 turn', { selfSend: true })
+    expect(w.sends.length).toBe(1)
+  })
+
+  test('暫存回覆送件失敗、降級排入成功：降級 prompt 帶上先前暫存的回覆', async ($: any, on: any) => {
+    const { w } = await holdFirst($, on, { send: [FAIL] })
+    await runTurn($, '收尾', { selfSend: true })
+    expect(w.prompts.length).toBe(1)
+    expect(w.prompts[0]).toContain('先前暫存的等待中回覆')
+  })
+
+  test('暫存寫不進 store：改為立即送出，不延後', async ($: any, on: any) => {
+    const w = world(on, { storeWritesOk: 0 })
+    mock.clock(on)
+    w.toolResults.Bash = { backgroundTaskId: 'bt1' }
+    await start($, on)
+    await submit($)
+    await runTurn($, '等待中', { calls: [BASH_BG] })
+    expect(w.sends.length).toBe(1)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=final-reply /)
+    expect(w.logs.some(l => l.includes('無法暫存'))).toBe(true)
+  })
+
+  test('Monitor：只帶 event 的通知不銷帳，帶 status 才銷', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    w.toolResults.Monitor = { taskId: 'mon1' }
+    await start($, on)
+    await submit($)
+    await runTurn($, '監看中', { calls: [{ tool: 'Monitor', command: 'tail -f x' }] })
+    await notify($, '<task-notification>\n<task-id>mon1</task-id>\n<event>MON1</event>\n</task-notification>')
+    await runTurn($, '收到事件，繼續等')
+    expect(w.sends).toEqual([])
+    expect(String((w.store.get(HELD) as any).text)).toBe('監看中\n\n收到事件，繼續等')
+    await notify($, done('mon1'))
+    await runTurn($, '監看結束')
+    expect(w.sends.length).toBe(1)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=held-reply,final-reply /)
+  })
+
+  test('背景 Agent 的完成是 peer 訊息：銷帳；指揮站的一般來信不動帳', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    w.toolResults.Agent = { isAsync: true, agentId: 'a167', status: 'async_launched' }
+    await start($, on)
+    await submit($)
+    await runTurn($, '子代理跑中', { calls: [{ tool: 'Agent', prompt: '去查', run_in_background: true }] })
+    await notify($, '<cross-session-message from="uds:/tmp/cc-socks/1.sock">請回報進度</cross-session-message>', 'peer')
+    await runTurn($, '仍在等子代理')
+    expect(w.sends).toEqual([])
+    await notify($, '<agent-message from="a167">[Subagent hand-back] done</agent-message>', 'peer')
+    await runTurn($, '子代理回來了')
+    expect(w.sends.length).toBe(1)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=held-reply,final-reply /)
+  })
+
+  test('ScheduleWakeup：以排程時的 prompt 原文對回 scheduled-trigger', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    w.toolResults.ScheduleWakeup = { scheduledFor: 1234, clampedDelaySeconds: 60, wasClamped: false }
+    await start($, on)
+    await submit($)
+    await runTurn($, '等排程', { calls: [{ tool: 'ScheduleWakeup', delaySeconds: 60, prompt: 'check-ci', reason: 'poll' }] })
+    expect(w.sends).toEqual([])
+    await notify($, 'check-ci', 'scheduled-trigger')
+    await runTurn($, 'CI 綠了')
+    expect(w.sends.length).toBe(1)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=held-reply,final-reply /)
+  })
+
+  test('subagent 內的背景呼叫與隨最終回覆終止的背景指令都不登帳：照現行規則立即送出', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    w.toolResults.Bash = { backgroundTaskId: 'bt1' }
+    await start($, on)
+    await submit($)
+    await runTurn($, '一', { calls: [{ ...BASH_BG, agentId: 'sub-1' }] })
+    expect(w.sends.length).toBe(1)
+    w.toolResults.Bash = { backgroundTaskId: 'bt2', backgroundEndsWithFinalResponse: true }
+    await runTurn($, '二', { calls: [BASH_BG] })
+    expect(w.sends.length).toBe(2)
+    expect(w.store.has(HELD)).toBe(false)
+  })
+
+  test('停用（mission 檔搬走）後取消計時器：不叫醒、不送', async ($: any, on: any) => {
+    const { w, clock } = await holdFirst($, on)
+    w.files.delete(`${DIR}/shop.json`)
+    await runTurn($, '還有一句') // 停用
+    await clock.advance(HOLD_LIMIT_MS * 2)
+    expect(w.prompts).toEqual([])
+    expect(w.sends).toEqual([])
+  })
+
+  test('注入段提醒：背景工作進行中要立即回應就用 SendMessage（自送不延後）', async ($: any, on: any) => {
+    world(on)
+    await start($, on)
+    await submit($)
+    const sections = ((await $.prompt.compose(COMPOSE)) as any).sections
+    expect(sections[0].text).toContain('暫存')
+    expect(sections[0].text).toContain('SendMessage')
+    expect(sections[0].text).not.toContain('AskUserQuestion')
   })
 })
