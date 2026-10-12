@@ -60,9 +60,9 @@ mission 目錄裡沒有任何 mission 寫了 `station` 時，mod 連名冊都不
 ## 行為
 
 - **只送有變更的內容**：結果檔與上次送出的不同才送；新內容以舊內容開頭時只送追加段，否則送全文。記錄遺失時當成沒送過、送全文（寧可重複，不要漏送）。
-- **最終回覆**：worker 本 turn 沒有自己 `SendMessage` 時，最終回覆附帶送出，**不設長度門檻**（一行的「要不要 push？」也要送到）。worker 已自送時不附最終回覆，但結果檔變更照送。
+- **最終回覆**：worker 本 turn 沒有自己 `SendMessage` 時，最終回覆附帶送出，**不設長度門檻**（一行的「要不要 push？」也要送到）。worker 已自送時不附最終回覆，但結果檔變更照送。背景工作進行中的「等待中」回覆例外：先暫存、延後併入下一則（見下節）。
 - **只在正常答覆結束的 turn 送**：中斷、錯誤、subagent 的 turn 不送，下一次正常 turn 補送。
-- **注入一段說明**到 worker 的 system prompt：回報寫進結果檔後以一行結束、不要為同一份回報再 `SendMessage`。需要問指揮站時照常 `SendMessage`，或寫在最終回覆。
+- **注入一段說明**到 worker 的 system prompt：回報寫進結果檔後以一行結束、不要為同一份回報再 `SendMessage`。需要問指揮站時照常 `SendMessage`，或寫在最終回覆；背景工作進行中要立即回應時用 `SendMessage`（自送不延後，見下節）。
 - **訊息格式**（指揮站若要解析，以此為準）：
 
   ```text
@@ -72,13 +72,28 @@ mission 目錄裡沒有任何 mission 寫了 `station` 時，mod 連名冊都不
   <該部分原文>
   ```
 
-  `part` 是 `result-full`、`result-append`、`final-reply` 之一；`chars` 是各部分原文長度加總。
+  `part` 是 `result-full`、`result-append`、`held-reply`、`final-reply` 之一，本文依這個順序排列（時間先後）；`chars` 是各部分原文長度加總。`held-reply` 是先前因背景工作進行中而暫存、延後送出的最終回覆（見下節）。
+
+### 背景工作進行中的回覆會暫存
+
+worker 常見的收尾是「起一個背景測試、說一句『等待中』、結束 turn」，背景工作完成時 Claude Code 再喚醒它。若每個「等待中」都立刻送出，指揮站每則都被喚醒一次。所以 turn 結束時**帳上仍有未通知的背景工作**，這則最終回覆不單獨送出，改為暫存，等下一則一起送。
+
+- **什麼算背景工作**：背景 `Bash`（有 `backgroundTaskId`）、`Monitor`、背景 `Agent`／`Task`、`ScheduleWakeup`、`CronCreate`；只記主迴圈（不含 subagent 內）發起的。收到對應的完成通知（背景 `Bash`、`Monitor` 帶 `<status>` 的那一則、背景 Agent 的回傳、排程的觸發）就銷帳；`Monitor` 的中途事件通知不算結束。
+- **暫存的條件（全部成立）**：正常答覆結束的主迴圈 turn、最終回覆非空、本 turn 結果檔沒有變更、worker 本 turn 沒有自己 `SendMessage`、帳上有未通知的背景工作。有結果檔變更、worker 自送、或沒有背景工作時，照原規則立即送出，單行提問也一樣。
+- **暫存只延後、不丟棄**，以 `held-reply` 併入送出，任一成立即送：
+  1. 下一個正常答覆結束的 turn（通常就是背景工作完成後那一則）——不論該 turn 自己有沒有東西要送、worker 是否自送。
+  2. 從第一則暫存起算 **10 分鐘**（固定常數；連續暫存的回覆以空行串接，不重設時限）。
+  3. session 結束（盡力而為；時間上限很短）。
+- **時限到時**：計時器回呼裡**只叫醒 worker**——排入一個「只回覆 ok」的 prompt，由那個 turn 結束時的 `turn.complete` 送出暫存。不在回呼裡直接送件：auto mode 下回呼內的送件不經 `tool.check`，會被擋下。叫醒 turn 一定送出（即使帳上仍有背景工作），它自己的「ok」不附帶。時限到時 worker 正在 turn 中就不叫醒，該 turn 結束時直接送出；為防狀態誤判，每 60 秒重確認一次，連續 5 次仍在 turn 中就直接叫醒。
+- **畫面一行**會說這則被暫存了：`↪ dispatch-relay：背景工作進行中，這則回覆已暫存，於下一則回報或最久 10 分鐘內轉送指揮站`。
+- 暫存內容存在 `$.store`，重新載入 plugin 不會丟，計時器依原起算時間重排。暫存寫不進去時改為立即送出（寧可多喚醒一次，不漏送）。
+- 帳是 mod 自己的記錄，不是 Claude Code 的內部狀態：漏登（未知的背景工具）只會變成立即送出；漏銷（完成通知沒對上）只會讓之後的等待中回覆被延後，每則仍受時限約束。兩種錯誤都不會漏送。
 
 ### 送不到的時候
 
 - 名冊上找不到 `station`、同名多筆（不猜是哪一個）、或送件失敗：mod **先**把內容記為已處理，**再**排一個 prompt 請 worker 自己 `SendMessage`。prompt 裡給的收件位址依序是：mission 檔的 `station` 名稱（SendMessage 直接收名稱）、上次成功送達時的位址，最後才是最近一則來訊的 `from` 位址——而且僅限該則來自指揮站。worker 可能收過其他 session 的訊息，「回覆最近一則」會把回報送給第三方。
 - 同一份內容只降級一次：降級那個 turn 裡再失敗，只在畫面與日誌說明，不再排 prompt，避免 worker 與 mod 互相觸發。
-- 連請 worker 自送的 prompt 都排不進去時，把「已處理」回滾，下一次正常 turn 結束時重送；畫面會照實說哪些東西不會重送。
+- 連請 worker 自送的 prompt 都排不進去時，把「已處理」回滾，下一次正常 turn 結束時重送；畫面會照實說哪些東西不會重送。結果檔以外的部分（暫存的 `held-reply`、最終回覆）沒有比對狀態可回滾，排入失敗就不重送。
 
 完成與否仍以 mission 檔的完成條件為準：轉送的訊息只是門鈴。
 
@@ -102,29 +117,36 @@ mission 目錄裡沒有任何 mission 寫了 `station` 時，mod 連名冊都不
 claude plugin validate ./plugins/dispatch-relay
 ```
 
-結果（v0.1.0）：
+結果（v0.2.0）：
 
 ```
-hooks: session.start, prompt.submit, prompt.compose, turn.start, tool.call{tool=SendMessage},
-       session.send, tool.check{tool=SendMessage}, turn.complete
-calls: $.env.get, $.fs.exists, $.fs.list, $.fs.read, $.fs.stat, $.process.run,
-       $.prompt.submit, $.session.cwd, $.session.id, $.session.root, $.session.send,
-       $.settings.read, $.store.delete, $.store.get, $.store.set, $.ui.log
+hooks: session.start, prompt.submit, prompt.compose, turn.start, tool.call,
+       tool.call{tool=SendMessage}, session.send, tool.check{tool=SendMessage},
+       turn.complete, session.end
+calls: $.clock.after, $.clock.now, $.env.get, $.fs.exists, $.fs.list, $.fs.read, $.fs.stat,
+       $.process.run, $.prompt.submit, $.session.cwd, $.session.id, $.session.root,
+       $.session.send, $.settings.read, $.store.delete, $.store.get, $.store.set, $.ui.log
 env reads: HOME
 env writes: nothing
 ```
 
 - `$.process.run`：只跑 `claude agents --json`
-- `$.session.send`：唯一的送件點，送給名冊解析出的指揮站
-- `$.prompt.submit`：唯一的降級點，送不到時請 worker 自己 `SendMessage`
+- `$.session.send`：唯一的送件點，送給名冊解析出的指揮站；只在 `turn.complete` 與 `session.end` 裡呼叫，計時器回呼不送件
+- `$.prompt.submit`：只在兩處排入——送不到時請 worker 自己 `SendMessage`，與暫存時限到時叫醒 worker
+- `$.clock.after`、`$.clock.now`：只用在暫存的時限（10 分鐘）與重確認
+- `tool.call`（不限工具）：只觀察、原樣放行，用來記哪些背景工作還沒通知；不改寫工具的輸入或結果
 - `$.fs.*`：只讀 mission 目錄、檢查安全邊界、讀結果檔；沒有寫檔
 
 ## 限制
 
-- 需要 Claude Code **v2.1.289 以上**（`turn.complete`、`$.session.send`、`tool.check` 的 `next.origin.plugin`、`$.store`、`$.prompt.submit`）。
+- 需要 Claude Code **v2.1.296 以上**（`turn.complete`、`$.session.send`、`tool.check` 的 `next.origin.plugin`、`$.store`、`$.prompt.submit`、`$.clock.after`、`session.end`）。0.1.0 的下限是 v2.1.289；0.2.0 新用到的 `$.clock.after` 與 `session.end` 只在 v2.1.296 驗證過，更早的版本沒有逐版查。
 - worker 必須有名字（`--name`）並出現在 `claude agents` 名冊上；沒命名的前景 session 對不到節點。
 - 經 marketplace 安裝會在每個 session 載入。沒有 mission 寫 `station` 時它只讀 mission 目錄，不做別的事。
 - 放行送件時無法驗證收件者：plugin 以 session id 送件時，`tool.check` 看到的收件者是引擎解析後的位址，對不回 session id，所以只驗證寄件 mod 是 dispatch-relay（日誌會寫一次）。
+- **`TaskStop` 不銷帳**：worker 用 `TaskStop` 停掉的背景工作不會有完成通知，帳上那一筆會一直在，之後的「等待中」回覆都被延後到時限才送出（最久 10 分鐘，加重確認最多 5 分鐘）。不會漏送，只是晚；要立即回應時 worker 用 `SendMessage`。
+- 暫存的回覆最久晚 10 分鐘到達指揮站。叫醒每次多一個 request（輸出幾個 token，讀的是 prompt cache；叫醒間隔若超過帳號的 cache TTL，會變成整份 context 的重新建立，這部分沒量過）。
+- 叫醒文字與背景工作的完成通知幾乎同時到時，叫醒旗標只認「下一個主迴圈 turn」，不比對文字：極少數情形下通知先開了 turn，那個 turn 的最終回覆（進度性質）會被當成叫醒 turn 而不附帶；暫存內容仍會送出。
+- session 被強制終止或崩潰時，暫存可能沒送出（內容仍在 worker 的 transcript 裡）；`session.end` 時還沒解析過指揮站 id 的話暫存保留在 `$.store`，不送也不清。
 - 不隱藏 worker 畫面上的最終回覆、不代寫結果檔。
 
 ## 開發
@@ -140,4 +162,6 @@ claude plugin test ./plugins/dispatch-relay     # 跑測試
 
 It is opt-in per mission: add `"station": "<commander session name>"` to a dispatch-board mission file. A session activates only if `claude agents --json` maps its own session id (`$.session.id()`) to a name that exactly one node's `session` matches (case-insensitive) in a mission that has a `station`. The station name is resolved to a session id from the roster before every send; no match or duplicate names means no send — the worker is asked to send it itself instead (once per content; no loops). Sessions with no stationed mission do nothing, not even read the roster.
 
-**Security:** the mod sends file contents to another session. It sends only the matched node's result file (relative to the project root, no absolute paths or `..`, symlinks resolved and kept inside the root, 256 KB cap) and the final reply, only to the one roster session named by `station`. Mission files are read under the same rules as dispatch-board: a user-level directory under your home, outside the session's project and any git work tree; a custom `missions_dir` is honoured only from `~/.claude/settings.json`, and when dispatch-relay has none of its own it reuses dispatch-board's (from the same file). Both sessions must be started with `--name`; run `claude` once in a new directory to accept the trust prompt before the first `claude --bg` there; for a `--worktree <name>` worker, `result_file` is relative to `<repo>/.claude/worktrees/<name>`. When forwarding fails, the worker is pointed at the `station` name first, and at the latest `from` address only if that message came from the station. In `tool.check` it allows only its own `SendMessage`; everything else passes through untouched. It writes no files and runs no completion checks. Requires Claude Code v2.1.289+.
+**Security:** the mod sends file contents to another session. It sends only the matched node's result file (relative to the project root, no absolute paths or `..`, symlinks resolved and kept inside the root, 256 KB cap) and the final reply, only to the one roster session named by `station`. Mission files are read under the same rules as dispatch-board: a user-level directory under your home, outside the session's project and any git work tree; a custom `missions_dir` is honoured only from `~/.claude/settings.json`, and when dispatch-relay has none of its own it reuses dispatch-board's (from the same file). Both sessions must be started with `--name`; run `claude` once in a new directory to accept the trust prompt before the first `claude --bg` there; for a `--worktree <name>` worker, `result_file` is relative to `<repo>/.claude/worktrees/<name>`. When forwarding fails, the worker is pointed at the `station` name first, and at the latest `from` address only if that message came from the station. In `tool.check` it allows only its own `SendMessage`; everything else passes through untouched. It writes no files and runs no completion checks.
+
+**Held replies (0.2.0):** a worker that starts a background job and ends its turn with a "waiting…" line would otherwise wake the commander once per such turn. When a turn ends while background work is still un-notified (background `Bash`, `Monitor`, background `Agent`, `ScheduleWakeup`, `CronCreate`, started by the main loop; settled by the matching completion notification), the final reply is held in the plugin's `$.store` instead of sent, provided the result file did not change and the worker did not `SendMessage` itself that turn. Held text is never dropped: it goes out as a `held-reply` part (order: result file → `held-reply` → `final-reply`) on the next normally-answered turn, after a fixed 10-minute limit counted from the first held reply, or at `session.end` (best effort). At the limit the timer callback only wakes the worker with a "reply ok" prompt and that turn's `turn.complete` does the send, because a send from inside a timer callback is refused under auto mode; the wake turn's own "ok" is not forwarded. The screen shows a line when a reply is held. A worker that needs the commander right away should use `SendMessage` itself, which is never delayed. Known limit: background jobs stopped with `TaskStop` produce no completion notification and are not settled, so later "waiting" replies are delayed to the 10-minute limit (never lost). Requires Claude Code v2.1.296+.

@@ -2,7 +2,7 @@
 // 本 mod 不使用 `$.state`（日誌走 `$.ui.log`、持久狀態走 `$.store`），故無 PluginState。
 
 /** 轉送訊息首行 `parts=` 的值域。改動屬 BREAKING（指揮站端若要解析訊息，以此為接縫）。 */
-export type Part = 'result-full' | 'result-append' | 'final-reply'
+export type Part = 'result-full' | 'result-append' | 'held-reply' | 'final-reply'
 
 /** 已啟用 session 的節點身份。`station` 是 mission 檔寫的名稱；session id 每次送件前由名冊解析，不快取。 */
 export type Identity = { missionId: string; nodeId: string; station: string; resultFile: string }

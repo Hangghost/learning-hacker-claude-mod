@@ -7,6 +7,9 @@
 //   - tool.check 只放行「本 mod 自己發出」的送件；worker 自己的 SendMessage 原樣通過。
 //   - session.send 只觀察本 mod 自己的送件，記下送達時引擎使用的位址（供降級 prompt 引用），原樣放行。
 //   - 送件失敗時請 worker 自己 SendMessage（先記為已處理，同一內容至多降級一次；降級排不進去則回滾，下次 turn 重送）。
+//   - 仍有未通知的背景工作時最終回覆暫存（$.store），於下一則、時限或 session 結束時以 held-reply 送出。
+//     時限到時 $.clock.after 回呼只叫醒 worker（$.prompt.submit），由叫醒 turn 的 turn.complete 送出：
+//     auto 下回呼內的 $.session.send 不經 tool.check、送不出去。
 // 不做：不寫任何檔案（日誌走 ui.log、狀態走 store）、不寫結果檔、不執行 mission 檔的完成條件。
 //
 // 啟用判定：`$.session.id()` → `claude agents --json` 反查本 session 的名稱 → mission 目錄裡恰好一個節點的
@@ -16,10 +19,16 @@ import type { Register } from 'claude-code'
 
 import {
   DEFAULT_DIR,
+  HOLD_LIMIT_MS,
+  HOLD_RECHECK_MAX,
+  HOLD_RECHECK_MS,
   MAX_FILE_BYTES,
   PLUGIN,
   ROSTER_TIMEOUT_MS,
   SECTION_ID,
+  WAKE_TEXT,
+  bgEntryOf,
+  bgSettle,
   buildMessage,
   degradeFailedLine,
   degradePrompt,
@@ -30,20 +39,25 @@ import {
   failedAgainLine,
   findIdentity,
   gitProbePaths,
+  heldLine,
   inactiveLog,
   injectionText,
   isMissionFileName,
   isUnder,
+  mergeHeld,
   ownName,
+  parseHeld,
   parseMission,
   parseRoster,
   pickDir,
   resolveStation,
+  resultChanged,
   sendCheckVerdict,
+  shouldHold,
   truncate,
   trySubmit,
 } from './logic'
-import type { Built, Identity, RelayMission, Resolution, Roster } from './logic'
+import type { BgEntry, Built, Held, Identity, RelayMission, Resolution, Roster } from './logic'
 
 // ── 模組狀態（熱重載即重來；持久狀態只放 $.store）─────────────────────────────
 let dirSetting = DEFAULT_DIR
@@ -52,13 +66,22 @@ let lastStationId = '' // 最近一次解析到的指揮站 session id：tool.ch
 let lastDelivered = '' // 最近一次成功送達時引擎實際使用的收件位址（uds:…），降級 prompt 引用；綁行程，不進 $.store
 let lastDeliveredStation = '' // 取得 lastDelivered 的那次送件，送往的指揮站 id；與目前 id 不同時不引用該位址
 // forward() 送件期間的指揮站 id，供 session.send 觀察 hook 與位址一起記下。
-// 前提：forward() 不並行——它只在主迴圈的 turn.complete 被呼叫，同一 session 的主迴圈 turn 不重疊。
+// 前提：forward() 不並行——它只在主迴圈的 turn.complete 與 session.end 被呼叫，同一 session 的主迴圈 turn 不重疊。
+// 新增呼叫點前要重新檢查。
 let sendingTo = ''
 let selfSent = false // 本 turn worker 是否自己呼叫過 SendMessage（turn.start 重置）
 let pendingDegrade = false // 本 mod 剛排入一個降級 prompt，等它的 turn.start
 let inDegradedTurn = false // 目前這個 turn 是本 mod 排入的降級 turn
 let lastInactiveLog = '' // 未啟用的原因只在改變時出聲，避免每個 prompt 重複同一行
 let laxRecipientLogged = false
+// 背景工作帳與暫存／叫醒狀態（只在記憶體；暫存內容本身在 $.store）
+let ledger: BgEntry[] = [] // 本 session 主迴圈已發起、尚未收到完成通知的背景工作
+let inTurn = false // turn.start 設起、主迴圈 turn.complete 設落
+let wakeTurn = false // 時限叫醒：在計時器回呼內設定（回呼內排入的 prompt 不觸發 prompt.submit hook），下一個主迴圈 turn.complete 消費
+let flushNext = false // 下一次 turn.complete 必須送出暫存（時限到時 worker 在 turn 中，或叫醒沒成功）
+let holdTimer: { cancel: () => void } | null = null
+let recheckCount = 0 // 時限到時連續判為「在 turn 中」的次數，叫醒後歸零
+let timerEverArmed = false // 這個模組實例是否排過計時器：熱重載後為 false，resumeTimer 才會依 store 重排
 
 function log($: any, text: string): void {
   try {
@@ -169,12 +192,20 @@ async function resolve($: any, full = false): Promise<{ res: Resolution; roster:
   }
 }
 
+/** 名冊上解析得到指揮站就記下它的 session id（session.end 沒有時間再讀名冊時沿用）；解析不到不動。 */
+function noteStation(roster: Roster | null, station: string): void {
+  if (!roster) return
+  const to = resolveStation(roster, station)
+  if (to.ok) lastStationId = to.sessionId
+}
+
 /** 啟用嘗試：尚未啟用時才查。 */
 async function tryActivate($: any): Promise<void> {
   if (identity !== null) return
-  const { res } = await resolve($)
+  const { res, roster } = await resolve($)
   if (res.kind === 'match') {
     identity = res.identity
+    noteStation(roster, identity.station)
     lastInactiveLog = ''
     log($, `已啟用：mission ${identity.missionId} 節點 ${identity.nodeId}，回報轉送給 ${identity.station}`)
     return
@@ -184,14 +215,29 @@ async function tryActivate($: any): Promise<void> {
 
 // ── 轉送與降級 ──────────────────────────────────────────────────────────────
 
-/** 唯一的送件點：把訊息送給指揮站（每次送件前由名冊把名稱解析成 session id，不猜）。 */
-async function forward($: any, built: Built, roster: Roster | null, station: string): Promise<{ ok: boolean; reason: string }> {
-  const to = resolveStation(roster ?? { available: false, note: '沒有名冊' }, station)
-  if (!to.ok) return { ok: false, reason: to.reason }
-  lastStationId = to.sessionId
-  sendingTo = to.sessionId
+/**
+ * 唯一的送件點：把訊息送給指揮站。`target` 是名冊加名稱（每次送件前解析成 session id，不猜），或直接給 session id
+ * （session.end 的時間上限很短，沿用最近一次解析到的 id，不再讀名冊）。
+ * 只在 turn.complete 與 session.end 內呼叫；計時器回呼 SHALL NOT 呼叫（auto 下回呼內的送出不經 tool.check，會被拒）。
+ */
+async function forward(
+  $: any,
+  built: Built,
+  target: { roster: Roster | null; station: string } | { sessionId: string },
+): Promise<{ ok: boolean; reason: string }> {
+  let sessionId: string
+  if ('sessionId' in target) {
+    if (!target.sessionId) return { ok: false, reason: '沒有指揮站 session id' }
+    sessionId = target.sessionId
+  } else {
+    const to = resolveStation(target.roster ?? { available: false, note: '沒有名冊' }, target.station)
+    if (!to.ok) return { ok: false, reason: to.reason }
+    sessionId = to.sessionId
+  }
+  lastStationId = sessionId
+  sendingTo = sessionId
   try {
-    const sent: any = await $.session.send({ to: { sessionId: to.sessionId }, text: built.text })
+    const sent: any = await $.session.send({ to: { sessionId }, text: built.text })
     return sent && sent.isDelivered ? { ok: true, reason: '' } : { ok: false, reason: String(sent?.reason ?? '未送達') }
   } catch (err) {
     return { ok: false, reason: String(err) }
@@ -200,8 +246,13 @@ async function forward($: any, built: Built, roster: Roster | null, station: str
   }
 }
 
+/** 本 mod 唯一會排入 prompt 的點（降級與時限叫醒共用）。回傳 `null`＝進入了，否則為失敗原因。 */
+async function queuePrompt($: any, text: string): Promise<string | null> {
+  return await trySubmit(() => $.prompt.submit({ text }))
+}
+
 /**
- * 唯一的降級點：排一個 turn 請 worker 自己 SendMessage。呼叫端 SHALL 已先把內容記為已處理。
+ * 降級點：排一個 turn 請 worker 自己 SendMessage。呼叫端 SHALL 已先把內容記為已處理。
  * 排入呼叫拋例外，或 resolve 為 `{ drop }`，皆為失敗——後者若當成功，內容會停在「已處理」卻沒有人送。
  */
 async function degrade($: any, id: Identity, built: Built, reason: string): Promise<{ ok: boolean; reason: string }> {
@@ -209,7 +260,7 @@ async function degrade($: any, id: Identity, built: Built, reason: string): Prom
   // 上次成功送達的位址只在「送往的正是目前這個指揮站 id」時才給：id 改變代表指揮站重開，舊位址綁的是舊行程。
   const usable = lastDelivered && lastDeliveredStation === lastStationId ? lastDelivered : ''
   const text = degradePrompt(built, reason, id.resultFile, { station: id.station, lastDelivered: usable })
-  const failure = await trySubmit(() => $.prompt.submit({ text }))
+  const failure = await queuePrompt($, text)
   if (failure === null) return { ok: true, reason: '' }
   pendingDegrade = false
   log($, `降級 prompt 排入失敗：${truncate(failure, 120)}`)
@@ -273,20 +324,147 @@ async function restoreSent($: any, key: string, prev: string | undefined): Promi
   }
 }
 
+// ── 暫存的等待中回覆與時限叫醒 ──────────────────────────────────────────────
+
+function heldKey(root: string): string {
+  return `relay:held:${root}`
+}
+
+async function readHeld($: any, root: string): Promise<Held | null> {
+  try {
+    return parseHeld(await $.store.get(heldKey(root)))
+  } catch {
+    return null
+  }
+}
+
+/** 暫存寫不進 store 時回 false：呼叫端改為立即送出（暫存只是延後，寫不進就別延後，漏送不能）。 */
+async function writeHeld($: any, root: string, held: Held): Promise<boolean> {
+  try {
+    await $.store.set(heldKey(root), held)
+    return true
+  } catch (err) {
+    log($, `無法暫存等待中的回覆（改為立即送出）：${truncate(String(err), 120)}`)
+    return false
+  }
+}
+
+async function clearHeld($: any, root: string): Promise<void> {
+  try {
+    await $.store.delete(heldKey(root))
+  } catch (err) {
+    log($, `無法清除暫存的等待中回覆（之後可能重複送出）：${truncate(String(err), 120)}`)
+  }
+}
+
+async function nowMs($: any): Promise<number> {
+  try {
+    return Number(await $.clock.now())
+  } catch {
+    return Date.now()
+  }
+}
+
+function disarm(): void {
+  try {
+    holdTimer?.cancel()
+  } catch {}
+  holdTimer = null
+}
+
+/** 排一個 ms 毫秒後的計時器（取代既有的）。回呼只叫醒，不送件：auto 下回呼內的送出不經 tool.check。 */
+function arm($: any, root: string, ms: number): void {
+  disarm()
+  timerEverArmed = true
+  try {
+    holdTimer = $.clock.after(Math.max(0, ms), () => {
+      holdTimer = null
+      void onHoldExpiry($, root).catch(() => {})
+    })
+  } catch (err) {
+    holdTimer = null
+    log($, `無法排入暫存時限的計時器（暫存留待下一個答覆 turn 或 session 結束送出）：${truncate(String(err), 120)}`)
+  }
+}
+
+/**
+ * 熱重載會取消計時器：下一個 hook 呼叫時依 `$.store` 記錄的起算時間重排。
+ * 只在這個模組實例從未排過計時器時做：已排過並觸發的（叫醒、重確認）不得因下一個 turn.start 再叫醒一次，否則叫醒迴圈。
+ */
+async function resumeTimer($: any): Promise<void> {
+  if (identity === null || holdTimer !== null || timerEverArmed) return
+  let root = ''
+  try {
+    root = await $.session.root()
+  } catch {
+    return
+  }
+  const held = await readHeld($, root)
+  if (held !== null) arm($, root, held.since + HOLD_LIMIT_MS - (await nowMs($)))
+}
+
+/**
+ * 暫存時限到。worker 閒置：以 `$.prompt.submit` 叫醒，旗標在這裡設（回呼內排入的 prompt 不觸發 prompt.submit hook），
+ * 由叫醒 turn 的 turn.complete 送出。worker 在 turn 中：不叫醒，旗標讓該 turn 的 turn.complete 無條件送出；
+ * `inTurn` 可能被 subagent 的 turn.start 誤設，所以定期重確認，連續 HOLD_RECHECK_MAX 次仍在 turn 中就直接叫醒。
+ */
+async function onHoldExpiry($: any, root: string): Promise<void> {
+  if (identity === null || (await readHeld($, root)) === null) return
+  if (inTurn && recheckCount < HOLD_RECHECK_MAX) {
+    recheckCount += 1
+    flushNext = true
+    arm($, root, HOLD_RECHECK_MS)
+    return
+  }
+  recheckCount = 0
+  wakeTurn = true
+  const failure = await queuePrompt($, WAKE_TEXT)
+  if (failure !== null) {
+    wakeTurn = false
+    flushNext = true
+    log($, `暫存時限到了但叫醒 prompt 排入失敗（${truncate(failure, 120)}）：暫存留待下一個答覆 turn 或 session 結束時送出`)
+  }
+}
+
+/** session.end（時間上限很短，best-effort）：送出暫存的等待中回覆，沿用最近一次的指揮站 id。 */
+async function flushOnEnd($: any): Promise<void> {
+  disarm()
+  if (identity === null) return
+  let root = ''
+  try {
+    root = await $.session.root()
+  } catch {
+    return
+  }
+  const held = await readHeld($, root)
+  if (held === null) return
+  if (!lastStationId) {
+    // 沒有可用的位址：暫存留在 store（session 日後 resume 時由下一個答覆 turn 帶出），不清空
+    log($, 'session 結束時暫存的等待中回覆未能送出：還沒解析過指揮站的 session id（暫存保留，resume 後下一則回報帶出）')
+    return
+  }
+  await clearHeld($, root)
+  const sent = await forward($, buildMessage(identity, undefined, null, '', true, held.text), { sessionId: lastStationId })
+  if (!sent.ok) log($, `session 結束時暫存的等待中回覆未能送出（不會重送）：${truncate(sent.reason, 120)}`)
+}
+
 export const register: Register = (on, options) => {
   const configured = (options as Record<string, unknown> | undefined)?.missions_dir
   dirSetting = typeof configured === 'string' && configured.trim() ? configured : DEFAULT_DIR
 
   on('session.start', async ($, e, next) => {
     await tryActivate($)
+    await resumeTimer($)
     return next(e)
   })
 
   // 啟動時 mission 檔可能還沒寫好、session 可能還沒命名：每個新 prompt 在尚未啟用時重試。
-  // 本 mod 自己排入的降級 prompt 不觸發重試（能降級代表已啟用）。
+  // 本 mod 自己排入的 prompt（降級、叫醒）不觸發重試（能降級代表已啟用），也不是背景工作的通知。
   on('prompt.submit', async ($, e, next) => {
     const own = (e as any).origin?.kind === 'plugin' && (e as any).origin?.name === PLUGIN
     if (identity === null && !own) await tryActivate($)
+    // 只觀察：銷帳
+    if (identity !== null && !own) ledger = bgSettle(ledger, (e as any).origin?.kind, String((e as any).text ?? ''))
     return next(e)
   })
 
@@ -298,9 +476,21 @@ export const register: Register = (on, options) => {
 
   on('turn.start', async ($, e, next) => {
     selfSent = false
+    inTurn = true
     inDegradedTurn = pendingDegrade
     pendingDegrade = false
+    await resumeTimer($)
     return next(e)
+  })
+
+  // 只觀察、原樣放行：登帳。結果在 next(e) 之後才看得到 task id；只登主迴圈（agentId 為 undefined）的呼叫。
+  on('tool.call', async ($, e, next) => {
+    const r = await next(e)
+    if (identity !== null && (e as any).agentId === undefined) {
+      const entry = bgEntryOf(String((e as any).tool), e as any, (r as any)?.result)
+      if (entry !== null) ledger = [...ledger, entry]
+    }
+    return r
   })
 
   // 只觀察、原樣放行：記下 worker 本 turn 是否自己送過件。
@@ -337,19 +527,29 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
     if (e.agentId !== undefined) return r
+    inTurn = false
     const wasDegraded = inDegradedTurn
     inDegradedTurn = false
-    if (identity === null || e.reason !== 'answer') return r
+    const wasWake = wakeTurn
+    wakeTurn = false
+    if (identity === null) return r
+    if (e.reason !== 'answer') {
+      // 叫醒 turn 沒有以答覆結束：不再叫醒（避免迴圈），留給下一個答覆 turn 無條件送出
+      if (wasWake) flushNext = true
+      return r
+    }
 
     // 每次送件前重新判定：mission 檔被搬走或改派、session 改名時停用；指揮站重開換 id 也跟得上。
     const { res, roster } = await resolve($, true)
     if (res.kind !== 'match') {
+      disarm()
       identity = null
       logInactive($, `停用（${inactiveLog(res)}）`)
       return r
     }
     const id = res.identity
     identity = id
+    noteStation(roster, id.station)
 
     let root = ''
     try {
@@ -357,13 +557,31 @@ export const register: Register = (on, options) => {
     } catch {
       return r
     }
+    // 叫醒 turn 與「必須送出」旗標：無條件送出暫存，不再進入暫存
+    const mustFlush = wasWake || flushNext
+    flushNext = false
     const key = sentKey(root, id.resultFile)
     const content = await readResult($, root, id.resultFile)
     const prev = await readSent($, key)
-    const built = buildMessage(id, prev, content, e.answer, selfSent)
+    const held = await readHeld($, root)
+    // 叫醒 turn 自己的最終回覆是對叫醒文字的應答（「ok」），不是 worker 的回報
+    const answer = wasWake ? '' : e.answer
+    if (shouldHold({ answer, resultChanged: resultChanged(prev, content), selfSent, pending: ledger.length, mustFlush })) {
+      const merged = mergeHeld(held, answer, await nowMs($))
+      if (await writeHeld($, root, merged)) {
+        if (holdTimer === null) arm($, root, merged.since + HOLD_LIMIT_MS - (await nowMs($)))
+        return { ...r, text: heldLine() }
+      }
+    }
+    // 先清空暫存再送，避免同一內容同時經降級與下一次暫存送出兩次
+    if (held !== null) {
+      disarm()
+      await clearHeld($, root)
+    }
+    const built = buildMessage(id, prev, content, answer, selfSent, held?.text ?? '')
     if (built.parts.length === 0) return r
 
-    const sent = await forward($, built, roster, id.station)
+    const sent = await forward($, built, { roster, station: id.station })
     if (sent.ok) {
       if (built.nextSent !== null) await markSent($, key, built.nextSent)
       return { ...r, text: deliveredLine(built, id.station) }
@@ -380,6 +598,14 @@ export const register: Register = (on, options) => {
     // 不自行排任何 prompt，所以不構成迴圈。
     const result = built.nextSent === null ? 'none' : (await restoreSent($, key, prev)) ? 'resend' : 'lost'
     const finalReply = built.parts.includes('final-reply')
-    return { ...r, text: degradeFailedLine(sent.reason, queued.reason, { result, finalReply }) }
+    const heldReply = built.parts.includes('held-reply')
+    return { ...r, text: degradeFailedLine(sent.reason, queued.reason, { result, finalReply, heldReply }) }
+  })
+
+  on('session.end', async ($, e, next) => {
+    try {
+      await flushOnEnd($)
+    } catch {}
+    return next(e)
   })
 }

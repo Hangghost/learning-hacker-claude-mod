@@ -1,7 +1,7 @@
 {
   "name": "dispatch-relay",
-  "version": "0.1.0",
-  "description": "dispatch-board 的搭檔：worker session 把回報寫進結果檔後以一行結束，由 mod 在 turn 結束時把新增內容與最終回覆轉送給指揮站（mission 檔寫了 station 才啟用；需 Claude Code ≥ 2.1.289）",
+  "version": "0.2.0",
+  "description": "dispatch-board 的搭檔：worker session 把回報寫進結果檔後以一行結束，由 mod 在 turn 結束時把新增內容與最終回覆轉送給指揮站；背景工作進行中的回覆暫存、延後併送（mission 檔寫了 station 才啟用；需 Claude Code ≥ 2.1.296）",
   "author": { "name": "Hangghost", "url": "https://github.com/Hangghost" },
   "types": "./types/index.d.ts",
   "userConfig": {

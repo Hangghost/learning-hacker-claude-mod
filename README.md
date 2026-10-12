@@ -9,7 +9,7 @@ Learning Hacker 的 [Claude Code mods](https://code.claude.com/docs/en/plugins/m
 | mod | 做什麼 | 版本 |
 |---|---|---|
 | [`dispatch-board`](plugins/dispatch-board) | 多個 session 分工時的派工看板：讀你寫的 mission 檔，顯示誰完成、誰在跑、誰在等你，狀態轉換時跳 toast | 0.1.0 |
-| [`dispatch-relay`](plugins/dispatch-relay) | dispatch-board 的搭檔：worker 把回報寫進結果檔後以一行結束，由 mod 在 turn 結束時轉送給指揮站 | 0.1.0 |
+| [`dispatch-relay`](plugins/dispatch-relay) | dispatch-board 的搭檔：worker 把回報寫進結果檔後以一行結束，由 mod 在 turn 結束時轉送給指揮站；背景工作進行中的回覆暫存、延後併送 | 0.2.0 |
 | [`handoff-runner`](plugins/handoff-runner) | bg session 在 worktree 做完的分支，由你在面板按一顆按鈕快轉進 main，執行前檢查、執行後驗證 | 0.1.0 |
 | [`working-memory`](plugins/working-memory) | 把 context window 畫成一顆腦：工具呼叫點亮對應腦區，用量越滿越擁擠，compact 時睡眠整理 | 0.1.0 |
 
@@ -34,7 +34,7 @@ Learning Hacker 的 [Claude Code mods](https://code.claude.com/docs/en/plugins/m
 /plugin install working-memory@learning-hacker-claude-mod
 ```
 
-dispatch-relay 需要 v2.1.289 以上。
+dispatch-relay 需要 v2.1.296 以上。
 
 在 shell 裡用 `claude plugin marketplace add …`、`claude plugin install …` 也可以。已開著的 session 執行 `/reload-plugins` 載入。
 
@@ -60,6 +60,7 @@ mission 檔格式與範例見 [plugins/dispatch-board/README.md](plugins/dispatc
 - 在 dispatch-board 的 mission 檔加上 `station`（指揮站的 session 名稱）才啟用；沒寫的 mission 不受影響
 - 身份判定：本 session 的 id → `claude agents --json` 查出名稱 → mission 檔裡恰好一個節點指派給這個名稱才啟用
 - 只送有變更的內容（追加時只送追加段）；送不到時請 worker 自己 `SendMessage`，同一份內容只請一次
+- 背景工作進行中（背景 Bash、Monitor、背景 Agent、排程）結束的 turn，最終回覆先暫存、不單獨喚醒指揮站，之後以 `held-reply` 併入下一則回報；最久 10 分鐘（時限到時只叫醒 worker、由它的 turn 結束時送出）。worker 自己 `SendMessage` 不延後
 
 前提：指揮站與 worker 都要用 `--name` 開，名稱與 `claude agents` 一致；新目錄第一次 `claude --bg` 前先在該目錄跑一次 `claude` 接受信任（否則回 `Workspace not trusted…`）；用 `--worktree <名>` 開的 worker，`result_file` 相對的是 `<repo>/.claude/worktrees/<名>`。自訂 mission 目錄只要在 dispatch-board 設一次，relay 會沿用。
 
@@ -101,7 +102,7 @@ mission 檔格式與範例見 [plugins/dispatch-board/README.md](plugins/dispatc
 
 ## 安裝前看看它會做什麼
 
-mod 不在沙盒裡執行，會以你的權限跑在 Claude Code 內。建議安裝前先讀原始碼，或 clone 後執行 `claude plugin validate ./plugins/<名稱>`，看它處理哪些事件、呼叫哪些能力。以下是 v0.1.0 的結果：
+mod 不在沙盒裡執行，會以你的權限跑在 Claude Code 內。建議安裝前先讀原始碼，或 clone 後執行 `claude plugin validate ./plugins/<名稱>`，看它處理哪些事件、呼叫哪些能力。以下是 v0.1.0 的結果（dispatch-relay 為 v0.2.0）：
 
 **dispatch-board**
 
@@ -118,14 +119,15 @@ calls: $.clock.every, $.clock.now, $.command.register, $.env.get, $.fs.exists, $
 **dispatch-relay**
 
 ```
-hooks: session.start, prompt.submit, prompt.compose, turn.start, tool.call{tool=SendMessage},
-       session.send, tool.check{tool=SendMessage}, turn.complete
-calls: $.env.get, $.fs.exists, $.fs.list, $.fs.read, $.fs.stat, $.process.run, $.prompt.submit,
-       $.session.cwd, $.session.id, $.session.root, $.session.send, $.settings.read,
-       $.store.delete, $.store.get, $.store.set, $.ui.log
+hooks: session.start, prompt.submit, prompt.compose, turn.start, tool.call,
+       tool.call{tool=SendMessage}, session.send, tool.check{tool=SendMessage},
+       turn.complete, session.end
+calls: $.clock.after, $.clock.now, $.env.get, $.fs.exists, $.fs.list, $.fs.read, $.fs.stat,
+       $.process.run, $.prompt.submit, $.session.cwd, $.session.id, $.session.root,
+       $.session.send, $.settings.read, $.store.delete, $.store.get, $.store.set, $.ui.log
 ```
 
-`$.process.run` 只跑 `claude agents --json`；`$.session.send` 只送給 mission 檔 `station` 對到的那一個 session；`$.prompt.submit` 只在送不到時請 worker 自己送；檔案只讀不寫；不連網、不呼叫模型。
+`$.process.run` 只跑 `claude agents --json`；`$.session.send` 只送給 mission 檔 `station` 對到的那一個 session；`$.prompt.submit` 只在送不到時請 worker 自己送、以及暫存時限到時叫醒 worker；`$.clock.*` 只用在暫存的 10 分鐘時限；`tool.call` 只觀察背景工作是否還沒通知、原樣放行；檔案只讀不寫；不連網、不呼叫模型。
 
 **handoff-runner**
 
@@ -173,10 +175,10 @@ A collection of Claude Code mods by Learning Hacker. Shared as-is, without suppo
 /plugin install working-memory@learning-hacker-claude-mod
 ```
 
-Requires Claude Code v2.1.287+ (dispatch-relay: v2.1.289+).
+Requires Claude Code v2.1.287+ (dispatch-relay: v2.1.296+).
 
 - **dispatch-board**: a board for running several Claude Code sessions in parallel. Reads mission files you write (nodes, the session responsible, a shell command that exits 0 when done) and shows who is done, who is running and who is waiting on you. Mission files are read only from a user-level directory (default `~/.claude/missions/`), never from a project, so cloning a repo cannot make it run someone else's commands.
-- **dispatch-relay**: the worker-side companion to dispatch-board. A worker writes its report to a result file and ends the turn with one line; the mod forwards what changed, plus the final reply, to the commanding session named by the mission's `station` field (opt-in per mission). It sends only the matched node's result file, kept inside the worker's project root, and only to the one roster session matching `station`.
+- **dispatch-relay**: the worker-side companion to dispatch-board. A worker writes its report to a result file and ends the turn with one line; the mod forwards what changed, plus the final reply, to the commanding session named by the mission's `station` field (opt-in per mission). It sends only the matched node's result file, kept inside the worker's project root, and only to the one roster session matching `station`. A final reply written while background work is still pending is held and sent later as a `held-reply` part (next reply, or after 10 minutes at most) instead of waking the commander on every "waiting…" turn.
 - **handoff-runner**: lets a background session that finished a branch in its own worktree issue a handoff ticket, which you land into `main` with one button. Tickets carry only parameters (branch, target, pinned commit); the git steps are derived by the mod, checked before running and verified after. Push is off by default.
 - **working-memory**: draws your context window as a brain. Tool calls light up regions, the brain fills up as context grows, and compaction plays a "sleep" sweep.
 

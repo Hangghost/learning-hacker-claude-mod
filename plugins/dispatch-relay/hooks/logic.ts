@@ -14,6 +14,19 @@ export const ROSTER_TIMEOUT_MS = 10000
 export const MAX_FILE_BYTES = 256 * 1024
 export const MAX_NODES = 50
 export const SECTION_ID = 'dispatch-relay:relay'
+/** 暫存時限（從第一則暫存起算，固定常數）。 */
+export const HOLD_LIMIT_MS = 10 * 60 * 1000
+/** 時限到時 worker 仍在 turn 中：每隔這麼久再確認一次是否已閒置。 */
+export const HOLD_RECHECK_MS = 60 * 1000
+/**
+ * 重確認的次數上限：連續這麼多次仍判為「在 turn 中」就當作狀態被誤設而直接叫醒。
+ * `inTurn` 只在主迴圈 turn.complete 落下；subagent 的 turn.start 若誤設了它而主迴圈已閒置，沒有上限的話會永遠重確認。
+ * 叫醒 prompt 在 worker 真的還在 turn 中時只會排在該 turn 之後，所以誤叫醒無害。
+ */
+export const HOLD_RECHECK_MAX = 5
+const HOLD_MINUTES = Math.round(HOLD_LIMIT_MS / 60000)
+/** 叫醒文字自帶完整指示：模型看到的會被包成「The <plugin> plugin sent a message: … Address the message above.」。 */
+export const WAKE_TEXT = 'dispatch-relay：暫存的回報已到時限，會在本 turn 結束時轉送給指揮站。只回覆 ok，不要做其他事。'
 
 export function truncate(s: string, max: number): string {
   const one = s.replace(/\s+/g, ' ').trim()
@@ -291,11 +304,18 @@ export type Built = {
   nextSent: string | null
 }
 
+/** 結果檔相對上次已處理的內容是否有變更（缺席、空白、相同都不算）。 */
+export function resultChanged(prev: string | undefined, content: string | null): boolean {
+  return content !== null && content !== (prev ?? '') && content.trim() !== ''
+}
+
 /**
  * 組出本 turn 要轉送的訊息。
  *
  * - 結果檔：`content` 非 null、非空白、且與 `prev` 不同才轉送；以 `prev` 為前綴且 `prev` 非空時只送追加段，
  *   否則送全文。`prev` 缺失（狀態被清空）視為從未處理 → 全文：偏向重複而非漏送。
+ * - 暫存的等待中回覆（`held`，非空才算）：排在結果檔之後、最終回覆之前，**不受 `selfSent` 影響**——
+ *   暫存只延後、不丟棄，worker 自送的 turn 一樣把它帶出。
  * - 最終回覆：非空、且 worker 本 turn 沒自送時附帶為 `final-reply`，**不設長度或行數門檻**——
  *   worker 結束 turn 只有回報與提問兩種原因，兩者都要送達；以「超過一行」為門檻會吞掉單行提問。
  * - 自送時不附最終回覆，但結果檔變更仍轉送（結果檔是回報正本，自送的可能只是提問）。
@@ -306,11 +326,12 @@ export function buildMessage(
   content: string | null,
   answer: string,
   selfSent: boolean,
+  held = '',
 ): Built {
   const before = prev ?? ''
   const sections: { part: Part; body: string }[] = []
   let nextSent: string | null = null
-  if (content !== null && content !== before && content.trim() !== '') {
+  if (content !== null && resultChanged(prev, content)) {
     if (before !== '' && content.startsWith(before)) {
       sections.push({ part: 'result-append', body: content.slice(before.length) })
     } else {
@@ -318,6 +339,7 @@ export function buildMessage(
     }
     nextSent = content
   }
+  if (held.trim() !== '') sections.push({ part: 'held-reply', body: held.trim() })
   if (!selfSent && answer.trim() !== '') sections.push({ part: 'final-reply', body: answer.trim() })
   if (sections.length === 0) return { parts: [], text: '', chars: 0, nextSent: null }
   const chars = sections.reduce((n, s) => n + s.body.length, 0)
@@ -331,6 +353,7 @@ export function buildMessage(
 const PART_LABEL: Record<Part, string> = {
   'result-full': '結果檔全文',
   'result-append': '結果檔追加段',
+  'held-reply': '暫存的等待中回覆',
   'final-reply': '最終回覆',
 }
 
@@ -340,6 +363,11 @@ export function partsLabel(parts: readonly Part[]): string {
 
 export function deliveredLine(built: Built, station: string): string {
   return `↪ dispatch-relay：${partsLabel(built.parts)}（${built.chars} 字）已送達指揮站 ${station}`
+}
+
+/** 最終回覆被暫存時畫面的一行（不是靜默：worker 與使用者都看得到它被延後了）。 */
+export function heldLine(): string {
+  return `↪ dispatch-relay：背景工作進行中，這則回覆已暫存，於下一則回報或最久 ${HOLD_MINUTES} 分鐘內轉送指揮站`
 }
 
 export function degradedLine(reason: string): string {
@@ -375,17 +403,19 @@ export async function trySubmit(submit: () => Promise<unknown>): Promise<string 
  * - `result`：`resend`＝已回滾為未處理、下一個以答覆結束的 turn 會重送；`lost`＝回滾本身失敗，不會重送；
  *   `none`＝本次沒有結果檔部分。
  * - `finalReply`：本次是否附帶最終回覆。最終回覆沒有比對狀態可回滾，排入失敗即不會重送，SHALL 明說。
+ * - `heldReply`：本次是否帶出暫存的等待中回覆。暫存在送件前已清空，同樣不會重送。
  */
 export function degradeFailedLine(
   sendReason: string,
   submitReason: string,
-  outcome: { result: 'resend' | 'lost' | 'none'; finalReply: boolean },
+  outcome: { result: 'resend' | 'lost' | 'none'; finalReply: boolean; heldReply?: boolean },
 ): string {
   const parts: string[] = []
   if (outcome.result === 'resend') parts.push('結果檔內容維持未送出，下次 turn 結束時重送')
   if (outcome.result === 'lost') parts.push('結果檔內容無法回滾為未處理，不會重送')
+  if (outcome.heldReply) parts.push('暫存的等待中回覆不會重送')
   if (outcome.finalReply) parts.push('本則最終回覆不會重送')
-  if (outcome.result !== 'resend' || outcome.finalReply) parts.push('請指揮站以完成條件判定進度')
+  if (outcome.result !== 'resend' || outcome.finalReply || outcome.heldReply) parts.push('請指揮站以完成條件判定進度')
   return `⚠ dispatch-relay：轉送失敗（${truncate(sendReason, 80)}），也無法請 worker 自行送出（${truncate(submitReason, 80)}）；${parts.join('；')}`
 }
 
@@ -407,6 +437,7 @@ export function degradePrompt(built: Built, reason: string, resultFile: string, 
   if (built.parts.some(p => p === 'result-full' || p === 'result-append')) {
     what.push(`${resultFile} 的內容（${built.parts.includes('result-append') ? '本次新增的部分' : '全文'}）`)
   }
+  if (built.parts.includes('held-reply')) what.push('先前暫存的等待中回覆')
   if (built.parts.includes('final-reply')) what.push('你剛才那則最終回覆')
   const lines = [
     `dispatch-relay 沒能把回報轉送給指揮站（${reason}）。`,
@@ -430,6 +461,7 @@ export function injectionText(id: Identity): string {
     `每個 turn 結束時，dispatch-relay 會把專案根目錄 ${id.resultFile} 新增或變更的內容、以及你的最終回覆，原文送給指揮站 ${id.station}。`,
     `因此：回報寫進 ${id.resultFile} 後直接以一行結束本 turn；不要為同一份回報另外呼叫 SendMessage，也不要為回報再讀取或驗證結果檔。`,
     '需要問指揮站、被擋住或需要它決策時，照常用 SendMessage，或把問題寫在最終回覆，同樣會送達。',
+    `背景工作進行中需要指揮站立即回應時，用 SendMessage：那時結束 turn 的最終回覆會被暫存，等下一則回報或最久 ${HOLD_MINUTES} 分鐘才送出，自送不受延後。`,
     '節點是否完成仍以 mission 檔的完成條件為準。',
   ].join('')
 }
@@ -465,4 +497,90 @@ export function sendCheckVerdict(
   const recipient = classifyRecipient(input, station)
   if (recipient === 'mismatch') return { verdict: 'pass', lax: false }
   return { verdict: 'allow', lax: recipient === 'unverifiable' }
+}
+
+// ── 暫存的等待中回覆與背景工作帳 ────────────────────────────────────────────
+
+/** 存在 `$.store` 的暫存：原文（連續暫存以空行串接）與第一則暫存的時間（毫秒，時限由此起算）。 */
+export type Held = { text: string; since: number }
+
+export function parseHeld(v: unknown): Held | null {
+  if (v === null || typeof v !== 'object') return null
+  const { text, since } = v as { text?: unknown; since?: unknown }
+  return typeof text === 'string' && text.trim() !== '' && typeof since === 'number' ? { text, since } : null
+}
+
+/** 併入一則新的暫存：起算時間沿用第一則，連續暫存不重設時限。 */
+export function mergeHeld(held: Held | null, answer: string, now: number): Held {
+  const body = answer.trim()
+  return held ? { text: `${held.text}\n\n${body}`, since: held.since } : { text: body, since: now }
+}
+
+/**
+ * 本 turn 的最終回覆是否暫存。`pending`＝帳上未通知的背景工作數；`mustFlush`＝叫醒 turn 或「必須送出」旗標。
+ * 叫醒 turn 必須無條件送出：它若再進入暫存，每個時限就叫醒一次、永遠送不出去。
+ */
+export function shouldHold(i: { answer: string; resultChanged: boolean; selfSent: boolean; pending: number; mustFlush: boolean }): boolean {
+  return !i.mustFlush && i.pending > 0 && !i.selfSent && !i.resultChanged && i.answer.trim() !== ''
+}
+
+/** 帳上一筆：背景工作以 id 對回通知；排程以 prompt 原文對回觸發（觸發 prompt 不帶 id）。 */
+export type BgEntry = { id?: string; text?: string }
+
+const nonEmpty = (v: unknown): v is string => typeof v === 'string' && v !== ''
+
+/**
+ * `tool.call` 結果 → 要登的帳；沒有（失敗、前景、會隨最終回覆終止）回 null。
+ * 工具參數在事件頂層（Bash 事件的 keys 為 command、description、tool、tool_use_id，沒有 `input`）；
+ * 同時容忍 `input` 內層形狀，讀不到 prompt 時退為空字串（對不上 scheduled-trigger 只會走「銷最舊的排程」）。
+ * TaskStop 不處理：被停掉的背景工作不會有完成通知，帳會卡住，直到時限把暫存送出（見 README 已知限制）。
+ */
+export function bgEntryOf(tool: string, event: { prompt?: unknown; input?: { prompt?: unknown } }, result: unknown): BgEntry | null {
+  const prompt = event?.prompt ?? event?.input?.prompt
+  const r: any = result !== null && typeof result === 'object' ? result : {}
+  switch (tool) {
+    case 'Bash':
+      return nonEmpty(r.backgroundTaskId) && !r.backgroundEndsWithFinalResponse ? { id: r.backgroundTaskId } : null
+    case 'Monitor':
+      return nonEmpty(r.taskId) ? { id: r.taskId } : null
+    case 'Agent':
+    case 'Task':
+      return r.isAsync === true && nonEmpty(r.agentId) ? { id: r.agentId } : null
+    case 'ScheduleWakeup':
+      return r.scheduledFor !== undefined ? { text: String(prompt ?? '') } : null
+    case 'CronCreate':
+      return nonEmpty(r.id) ? { text: String(prompt ?? '') } : null
+    default:
+      return null
+  }
+}
+
+/**
+ * 一則 prompt → 銷帳後的帳（不就地修改）。錯誤只能造成「立即送出」或「有上界的延後」，所以對不上的一律偏向不動帳：
+ * Monitor 的事件通知（只帶 `<event>`）不是結束；帶 task id 卻對不上帳（漏登）不銷最舊一筆，否則會誤銷不相干的工作。
+ */
+export function bgSettle(entries: readonly BgEntry[], originKind: string | undefined, text: string): BgEntry[] {
+  const without = (i: number) => entries.filter((_, j) => j !== i)
+  // 對不上時只銷「同類」最舊一筆：通知對的是背景工作（id 類）、觸發對的是排程（text 類），跨類銷帳會誤銷不相干的工作
+  const oldestOf = (isKind: (en: BgEntry) => boolean) => {
+    const i = entries.findIndex(isKind)
+    return i >= 0 ? without(i) : [...entries]
+  }
+  if (originKind === 'task-notification') {
+    const id = /<task-id>\s*([^<\s]+)\s*<\/task-id>/.exec(text)?.[1]
+    if (id === undefined) return oldestOf(en => en.id !== undefined)
+    if (!/<status>/.test(text)) return [...entries]
+    const i = entries.findIndex(en => en.id === id)
+    return i >= 0 ? without(i) : [...entries]
+  }
+  if (originKind === 'peer') {
+    const from = /<agent-message from="([^"]+)"/.exec(text)?.[1]
+    const i = from === undefined ? -1 : entries.findIndex(en => en.id === from)
+    return i >= 0 ? without(i) : [...entries]
+  }
+  if (originKind === 'scheduled-trigger') {
+    const i = entries.findIndex(en => en.text !== undefined && en.text === text)
+    return i >= 0 ? without(i) : oldestOf(en => en.text !== undefined)
+  }
+  return [...entries]
 }
