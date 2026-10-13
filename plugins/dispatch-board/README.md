@@ -110,7 +110,7 @@ shop-redesign  ▓▓▓░░░░░░░ 1/3  商店改版
 
 **mission 檔裡的完成條件是 shell 指令，看板會以你的身分執行它。** 所以 mission 檔只從使用者層級的目錄讀，絕不讀專案目錄或 repo 裡的檔案，否則 clone 一個陌生 repo 就等於執行對方寫的指令。具體規則：
 
-- 預設目錄 `~/.claude/missions/`。可以在 `/plugin` 的設定改 `missions_dir`（`~/…` 或絕對路徑），但**只認 `~/.claude/settings.json` 裡的值**；專案的 `.claude/settings.json`、`settings.local.json` 或 `--settings` 給的值一律不採用。
+- 預設目錄 `~/.claude/missions/`。可以在 `/plugin` 的設定改 `missions_dir`（`~/…` 或絕對路徑），但**只認使用者層級設定裡的值**（`$.settings.read({ source: 'user' })` 讀到的，通常是 `~/.claude/settings.json`）；專案的 `.claude/settings.json`、`settings.local.json` 或 `--settings` 給的值一律不採用。
 - 目錄解析符號連結後必須在家目錄底下（不能是家目錄本身），不能在本 session 的專案目錄內，也不能在任何 git 工作樹內（從該目錄往上到家目錄之間任一層有 `.git` 就拒讀）。
 - 個別 mission 檔經符號連結指到目錄外的，拒讀並列在「讀不了的 mission 檔」。
 - 讀不到家目錄（`HOME` 未設定）就整個停用。
@@ -160,4 +160,4 @@ claude plugin test ./plugins/dispatch-board     # 跑測試
 
 **dispatch-board** is a dispatch board for running several Claude Code sessions in parallel. You write a mission file (`~/.claude/missions/*.json`) listing nodes, the session responsible for each, and a completion check (a shell command; exit 0 means done). The board shows a one-line band above the prompt and a `/dispatch` side pane grouped into *needs you / running / done, ready to wrap up*, and toasts on state transitions. Session state comes from `claude agents --json`; an unreadable roster is shown as "roster unavailable", never as "ended". A check that times out (5 s) or cannot run is shown as *undetermined* and grouped under *needs you*, never as still running. `/dispatch demo` shows fake data without reading anything or running any command.
 
-**Security:** completion checks are executed as you, so mission files are read only from a user-level directory: under your home directory, outside the session's project, outside any git work tree, with symlinks resolved. A custom `missions_dir` is honoured only from `~/.claude/settings.json`. Anything else is refused with the reason shown. The mod writes no files, sends no prompts, makes no network requests and calls no model.
+**Security:** completion checks are executed as you, so mission files are read only from a user-level directory: under your home directory, outside the session's project, outside any git work tree, with symlinks resolved. A custom `missions_dir` is honoured only from user-level settings (what `$.settings.read({ source: 'user' })` returns, normally `~/.claude/settings.json`). Anything else is refused with the reason shown. The mod writes no files, sends no prompts, makes no network requests and calls no model.

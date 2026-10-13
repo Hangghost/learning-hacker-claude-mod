@@ -10,6 +10,7 @@ import {
   WAKE_TEXT,
   bgEntryOf,
   bgSettle,
+  bgSettleStopped,
   buildMessage,
   checkResultFile,
   classifyRecipient,
@@ -29,6 +30,7 @@ import {
   resultChanged,
   sendCheckVerdict,
   shouldHold,
+  stoppedTaskIdOf,
   submitFailure,
   trySubmit,
 } from '../hooks/logic'
@@ -270,10 +272,14 @@ type World = {
   prompts: string[]
   submitReplies: SubmitReply[]
   logs: string[]
+  /** `ui.log` 以 `{ to: 'debug' }` 送出的行（不進 `logs`） */
+  debugLogs: string[]
   store: Map<string, unknown>
   storeAtPrompt: Record<string, unknown>[]
   /** 各工具 tool.call 的 result；未列者回 `{ ok: true }` */
   toolResults: Record<string, unknown>
+  /** 這些工具的 tool.call 結果帶 `isError: true`（錯誤在結果上，不在 result 內） */
+  toolErrors: Set<string>
 }
 
 function parentOf(p: string): string {
@@ -312,9 +318,11 @@ function world(
     prompts: [],
     submitReplies: opts.submit ?? ['ok'],
     logs: [],
+    debugLogs: [],
     store: new Map(Object.entries(opts.store ?? {})),
     storeAtPrompt: [],
     toolResults: {},
+    toolErrors: new Set(),
   }
   const value = (v: unknown) => ({ value: v })
   const real = (p: string) => {
@@ -354,7 +362,8 @@ function world(
     return ok(1)
   })
   on('ui.log', (_$: any, e: any) => {
-    w.logs.push(String(e.text))
+    if (e.to === 'debug') w.debugLogs.push(String(e.text))
+    else w.logs.push(String(e.text))
     return value(undefined)
   })
   on('session.send', (_$: any, e: any) => {
@@ -388,7 +397,10 @@ function world(
   on('prompt.compose', () => ({ sections: [] }))
   on('turn.start', (_$: any, e: any) => ({ turnId: e.turnId }))
   on('turn.complete', (_$: any, e: any) => ({ text: String(e.answer) }))
-  on('tool.call', (_$: any, e: any) => ({ result: w.toolResults[String(e.tool)] ?? { ok: true } }))
+  on('tool.call', (_$: any, e: any) => ({
+    result: w.toolResults[String(e.tool)] ?? { ok: true },
+    ...(w.toolErrors.has(String(e.tool)) ? { isError: true } : {}),
+  }))
   on('tool.check', () => ({ decision: 'ask' }))
   return w
 }
@@ -792,6 +804,29 @@ describe('logic：暫存與背景工作帳', () => {
     expect(bgSettle(ledger, 'sdk', 'x')).toEqual(ledger)
   })
 
+  test('stoppedTaskIdOf：只認成功的 TaskStop 且帶非空 task_id；錯誤、字串結果、缺 id、別的工具都不算', async () => {
+    const ok = { message: 'Successfully stopped task: b1 (sleep 300)', task_id: 'b1', task_type: 'local_bash', command: 'sleep 300' }
+    expect(stoppedTaskIdOf('TaskStop', ok, undefined)).toBe('b1')
+    expect(stoppedTaskIdOf('TaskStop', ok, false)).toBe('b1')
+    expect(stoppedTaskIdOf('TaskStop', ok, true)).toBeNull() // isError 在結果上
+    expect(stoppedTaskIdOf('TaskStop', 'Error: No task found with ID: zzz', true)).toBeNull()
+    expect(stoppedTaskIdOf('TaskStop', 'Error: No task found with ID: zzz', undefined)).toBeNull() // 字串結果沒有 task_id
+    expect(stoppedTaskIdOf('TaskStop', { message: 'x' }, undefined)).toBeNull()
+    expect(stoppedTaskIdOf('TaskStop', { task_id: '' }, undefined)).toBeNull()
+    expect(stoppedTaskIdOf('TaskStop', { task_id: 7 }, undefined)).toBeNull()
+    expect(stoppedTaskIdOf('TaskStop', undefined, undefined)).toBeNull()
+    expect(stoppedTaskIdOf('Bash', ok, undefined)).toBeNull()
+  })
+
+  test('bgSettleStopped：只銷 id 相符的一筆；對不上不動帳（不以最舊猜測）；不就地修改', async () => {
+    const ledger = [{ id: 'b1' }, { text: 'check' }, { id: 'b2' }]
+    expect(bgSettleStopped(ledger, 'b2')).toEqual([{ id: 'b1' }, { text: 'check' }])
+    expect(bgSettleStopped(ledger, 'b1')).toEqual([{ text: 'check' }, { id: 'b2' }])
+    expect(bgSettleStopped(ledger, 'zzz')).toEqual(ledger)
+    expect(bgSettleStopped([], 'b1')).toEqual([])
+    expect(ledger.length).toBe(3)
+  })
+
   test('degradeFailedLine／degradePrompt／injectionText 涵蓋 held-reply', async () => {
     expect(degradeFailedLine('x', 'y', { result: 'none', finalReply: false, heldReply: true })).toContain('暫存的等待中回覆不會重送')
     const built = buildMessage(IDS, undefined, null, '', true, '暫存')
@@ -1109,6 +1144,98 @@ describe('暫存的等待中回覆與時限叫醒', () => {
     await runTurn($, '二', { calls: [BASH_BG] })
     expect(w.sends.length).toBe(2)
     expect(w.store.has(HELD)).toBe(false)
+  })
+
+  const STOP_OK = (id: string) => ({ message: `Successfully stopped task: ${id} (sleep 300)`, task_id: id, task_type: 'local_bash', command: 'sleep 300' })
+  const STOP = (id: string) => ({ tool: 'TaskStop', task_id: id })
+
+  test('TaskStop 成功：帳上那一筆銷掉，其後的進度回覆在本 turn 送出，不暫存到時限', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    w.toolResults.Bash = { backgroundTaskId: 'bt1' }
+    await start($, on)
+    await submit($)
+    await runTurn($, '一', { calls: [BASH_BG, ...[]] }) // 起背景 Bash：暫存
+    expect(w.store.has(HELD)).toBe(true)
+    w.toolResults.TaskStop = STOP_OK('bt1')
+    await runTurn($, '已停掉背景測試', { calls: [STOP('bt1')] })
+    expect(w.sends.length).toBe(1)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=held-reply,final-reply /)
+    expect(w.store.has(HELD)).toBe(false)
+    // 帳已空：之後的 turn 立即送出，不再暫存
+    await runTurn($, '收尾')
+    expect(w.sends.length).toBe(2)
+    expect(w.store.has(HELD)).toBe(false)
+  })
+
+  test('TaskStop 失敗（結果帶 isError）不銷帳：其後的等待中 turn 照現行規則暫存', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    w.toolResults.Bash = { backgroundTaskId: 'bt1' }
+    await start($, on)
+    await submit($)
+    await runTurn($, '一', { calls: [BASH_BG] })
+    w.toolResults.TaskStop = 'Error: No task found with ID: zzz'
+    w.toolErrors.add('TaskStop')
+    await runTurn($, '停一個不存在的', { calls: [STOP('zzz')] })
+    expect(w.sends).toEqual([])
+    expect(w.store.get(HELD)).toMatchObject({ text: '一\n\n停一個不存在的' })
+  })
+
+  test('TaskStop 只銷它停掉的那一筆：另一筆還在，等待中的 turn 照現行規則暫存', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    w.toolResults.Bash = { backgroundTaskId: 'bt1' }
+    await start($, on)
+    await submit($)
+    await runTurn($, '一', { calls: [BASH_BG] })
+    w.toolResults.Bash = { backgroundTaskId: 'bt2' }
+    await runTurn($, '二', { calls: [BASH_BG] })
+    w.toolResults.TaskStop = STOP_OK('bt1')
+    await runTurn($, '停掉第一個', { calls: [STOP('bt1')] })
+    expect(w.sends).toEqual([]) // bt2 還在
+    expect(w.store.get(HELD)).toMatchObject({ text: '一\n\n二\n\n停掉第一個' })
+    await notify($, done('bt2'))
+    await runTurn($, '都好了')
+    expect(w.sends.length).toBe(1)
+  })
+
+  test('被停掉的背景 Agent 之後的 killed 通知不誤銷其他工作', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    w.toolResults.Agent = { isAsync: true, agentId: 'ag1' }
+    w.toolResults.Bash = { backgroundTaskId: 'bt1' }
+    await start($, on)
+    await submit($)
+    await runTurn($, '起 agent 與 bash', { calls: [{ tool: 'Agent' }, BASH_BG] })
+    w.toolResults.TaskStop = { ...STOP_OK('ag1'), task_type: 'local_agent' }
+    await runTurn($, '停掉 agent', { calls: [STOP('ag1')] })
+    await notify($, `<task-notification>\n<task-id>ag1</task-id>\n<status>killed</status>\n</task-notification>`)
+    await runTurn($, '還在等 bash') // bt1 仍在帳上：暫存
+    expect(w.sends).toEqual([])
+    expect(w.store.has(HELD)).toBe(true)
+  })
+
+  test('subagent 內的 TaskStop 不動帳', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    w.toolResults.Bash = { backgroundTaskId: 'bt1' }
+    await start($, on)
+    await submit($)
+    await runTurn($, '一', { calls: [BASH_BG] })
+    w.toolResults.TaskStop = STOP_OK('bt1')
+    await runTurn($, '二', { calls: [{ ...STOP('bt1'), agentId: 'sub-1' }] })
+    expect(w.sends).toEqual([]) // 帳上 bt1 仍在
+    expect(w.store.has(HELD)).toBe(true)
+  })
+
+  test('subagent 的 turn.start 不動主迴圈的 turn 狀態：不讓 inTurn 卡住，時限到時閒置的 worker 直接被叫醒', async ($: any, on: any) => {
+    const { w, clock } = await holdFirst($, on)
+    // 主迴圈已閒置；subagent 的 turn.start 不應把 inTurn 設起
+    await $.turn.start({ text: 'sub', turnId: 'sub-t', agentId: 'sub-1' } as any)
+    await clock.advance(HOLD_LIMIT_MS)
+    // 閒置 → 直接叫醒（沒有進入「在 turn 中」重確認）
+    expect(w.prompts).toEqual([WAKE_TEXT])
   })
 
   test('停用（mission 檔搬走）後取消計時器：不叫醒、不送', async ($: any, on: any) => {

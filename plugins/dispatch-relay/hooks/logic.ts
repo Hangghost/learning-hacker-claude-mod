@@ -533,7 +533,7 @@ const nonEmpty = (v: unknown): v is string => typeof v === 'string' && v !== ''
  * `tool.call` 結果 → 要登的帳；沒有（失敗、前景、會隨最終回覆終止）回 null。
  * 工具參數在事件頂層（Bash 事件的 keys 為 command、description、tool、tool_use_id，沒有 `input`）；
  * 同時容忍 `input` 內層形狀，讀不到 prompt 時退為空字串（對不上 scheduled-trigger 只會走「銷最舊的排程」）。
- * TaskStop 不處理：被停掉的背景工作不會有完成通知，帳會卡住，直到時限把暫存送出（見 README 已知限制）。
+ * TaskStop 不在這裡登帳；它的銷帳見 `stoppedTaskIdOf`／`bgSettleStopped`。
  */
 export function bgEntryOf(tool: string, event: { prompt?: unknown; input?: { prompt?: unknown } }, result: unknown): BgEntry | null {
   const prompt = event?.prompt ?? event?.input?.prompt
@@ -583,4 +583,22 @@ export function bgSettle(entries: readonly BgEntry[], originKind: string | undef
     return i >= 0 ? without(i) : oldestOf(en => en.text !== undefined)
   }
   return [...entries]
+}
+
+/**
+ * `TaskStop` 的 `tool.call` 結果 → 引擎確認停掉的 task id；不是成功的 TaskStop 回 null。
+ * 成功時 `result` 為 `{ message, task_id, task_type, command }`；失敗（id 不存在、已結束）時 `result` 是字串 `"Error: …"`，
+ * 且 `isError` 在「結果」上（和 `result` 同層），不在 `result` 裡。
+ * 被停掉的背景 Bash 與 Monitor 沒有完成通知，只能靠這條銷帳；背景 Agent 之後仍有 `killed` 通知，先銷無害（對不上帳不動帳）。
+ */
+export function stoppedTaskIdOf(tool: string, result: unknown, isError: unknown): string | null {
+  if (tool !== 'TaskStop' || isError) return null
+  const id = result !== null && typeof result === 'object' ? (result as any).task_id : undefined
+  return nonEmpty(id) ? id : null
+}
+
+/** 銷掉帳上 id 相符的那一筆（不就地修改）；對不上不動帳，不以「最舊」之類的猜測銷帳。 */
+export function bgSettleStopped(entries: readonly BgEntry[], id: string): BgEntry[] {
+  const i = entries.findIndex(en => en.id === id)
+  return i >= 0 ? entries.filter((_, j) => j !== i) : [...entries]
 }

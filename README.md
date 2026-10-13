@@ -9,7 +9,7 @@ Learning Hacker 的 [Claude Code mods](https://code.claude.com/docs/en/plugins/m
 | mod | 做什麼 | 版本 |
 |---|---|---|
 | [`dispatch-board`](plugins/dispatch-board) | 多個 session 分工時的派工看板：讀你寫的 mission 檔，顯示誰完成、誰在跑、誰在等你，狀態轉換時跳 toast | 0.1.0 |
-| [`dispatch-relay`](plugins/dispatch-relay) | dispatch-board 的搭檔：worker 把回報寫進結果檔後以一行結束，由 mod 在 turn 結束時轉送給指揮站；背景工作進行中的回覆暫存、延後併送 | 0.2.0 |
+| [`dispatch-relay`](plugins/dispatch-relay) | dispatch-board 的搭檔：worker 把回報寫進結果檔後以一行結束，由 mod 在 turn 結束時轉送給指揮站；背景工作進行中的回覆暫存、延後併送 | 0.2.1 |
 | [`handoff-runner`](plugins/handoff-runner) | bg session 在 worktree 做完的分支，由你在面板按一顆按鈕快轉進 main，執行前檢查、執行後驗證 | 0.1.0 |
 | [`working-memory`](plugins/working-memory) | 把 context window 畫成一顆腦：工具呼叫點亮對應腦區，用量越滿越擁擠，compact 時睡眠整理 | 0.1.0 |
 
