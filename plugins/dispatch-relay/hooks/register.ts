@@ -29,6 +29,7 @@ import {
   WAKE_TEXT,
   bgEntryOf,
   bgSettle,
+  bgSettleStopped,
   buildMessage,
   degradeFailedLine,
   degradePrompt,
@@ -54,6 +55,7 @@ import {
   resultChanged,
   sendCheckVerdict,
   shouldHold,
+  stoppedTaskIdOf,
   truncate,
   trySubmit,
 } from './logic'
@@ -83,9 +85,9 @@ let holdTimer: { cancel: () => void } | null = null
 let recheckCount = 0 // 時限到時連續判為「在 turn 中」的次數，叫醒後歸零
 let timerEverArmed = false // 這個模組實例是否排過計時器：熱重載後為 false，resumeTimer 才會依 store 重排
 
-function log($: any, text: string): void {
+function log($: any, text: string, options?: { to: 'debug' }): void {
   try {
-    $.ui.log(text)
+    $.ui.log(text, options)
   } catch {}
 }
 
@@ -475,6 +477,8 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.start', async ($, e, next) => {
+    // 與 turn.complete 同一道門：subagent 的事件不動主迴圈的 turn 狀態（防禦：subagent 的 turn.start 若誤設 inTurn，主迴圈已閒置時暫存會被當成「在 turn 中」而多重確認）
+    if ((e as any).agentId !== undefined) return next(e)
     selfSent = false
     inTurn = true
     inDegradedTurn = pendingDegrade
@@ -483,12 +487,16 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // 只觀察、原樣放行：登帳。結果在 next(e) 之後才看得到 task id；只登主迴圈（agentId 為 undefined）的呼叫。
+  // 只觀察、原樣放行：登帳與 TaskStop 銷帳。結果在 next(e) 之後才看得到 task id；只處理主迴圈（agentId 為 undefined）的呼叫。
+  // TaskStop 成功才銷（`isError` 在結果上，不在 `result` 內）；停掉的背景 Bash／Monitor 沒有完成通知。
   on('tool.call', async ($, e, next) => {
     const r = await next(e)
     if (identity !== null && (e as any).agentId === undefined) {
-      const entry = bgEntryOf(String((e as any).tool), e as any, (r as any)?.result)
+      const tool = String((e as any).tool)
+      const entry = bgEntryOf(tool, e as any, (r as any)?.result)
       if (entry !== null) ledger = [...ledger, entry]
+      const stopped = stoppedTaskIdOf(tool, (r as any)?.result, (r as any)?.isError)
+      if (stopped !== null) ledger = bgSettleStopped(ledger, stopped)
     }
     return r
   })
@@ -519,7 +527,8 @@ export const register: Register = (on, options) => {
     if (verdict === 'pass') return next(e)
     if (lax && !laxRecipientLogged) {
       laxRecipientLogged = true
-      log($, '放行送件時無法驗證收件者（事件的收件者是引擎解析後的位址，不是 session id）：只驗證寄件 mod 為 dispatch-relay')
+      // 這是已知且固定的退化（README「限制」有寫），不是異常：只進除錯日誌，不佔對話畫面
+      log($, '放行送件時無法驗證收件者（事件的收件者是引擎解析後的位址，不是 session id）：只驗證寄件 mod 為 dispatch-relay', { to: 'debug' })
     }
     return { decision: 'allow' as const, reason: 'dispatch-relay 轉送回報給指揮站' }
   })
