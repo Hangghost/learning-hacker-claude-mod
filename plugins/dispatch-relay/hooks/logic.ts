@@ -88,14 +88,14 @@ export function dirRefusal(f: DirFacts): string | null {
 }
 
 /**
- * 自訂的 missions_dir 必須來自使用者層級設定（~/.claude/settings.json）。
+ * 自訂的 missions_dir 必須來自使用者層級設定（`$.settings.read({ source: 'user' })`，通常是 ~/.claude/settings.json）。
  * 專案的 .claude/settings.json 也能寫 pluginConfigs；不檢查來源的話，clone 一個陌生 repo
  * 就能把目錄指到別處、讓 relay 讀對方寫的 mission 檔。預設值不需要來源。
  */
 export function configRefusal(configured: string, userSettings: Readonly<Record<string, unknown>>): string | null {
   if (configured.trim() === DEFAULT_DIR) return null
   if (userDirOption(userSettings, PLUGIN) === configured) return null
-  return 'missions_dir 只接受使用者層級設定（~/.claude/settings.json）；其他來源的值不採用'
+  return 'missions_dir 只接受使用者層級設定（通常是 ~/.claude/settings.json）；其他來源的值不採用'
 }
 
 export const BOARD_PLUGIN = 'dispatch-board'
@@ -115,7 +115,7 @@ export function userDirOption(userSettings: Readonly<Record<string, unknown>>, p
 /**
  * 要用的 mission 目錄設定。優先序：本 mod 自己的 missions_dir → dispatch-board 的 missions_dir → 預設。
  * 兩者都只認使用者層級設定：`configured` 是引擎給本 mod 的值（可能來自專案設定，所以非預設值要過 configRefusal）；
- * dispatch-board 的值直接從 `userSettings`（只讀 ~/.claude/settings.json）取，專案設定裡的 board 鍵看不到、不採用。
+ * dispatch-board 的值直接從 `userSettings`（只讀使用者層級設定）取，專案設定裡的 board 鍵看不到、不採用。
  * 自訂目錄因此只要在 dispatch-board 設一次；沒裝 dispatch-board（設定裡沒有它的鍵）時行為不變。
  */
 export function pickDir(
@@ -371,7 +371,7 @@ export function heldLine(): string {
 }
 
 export function degradedLine(reason: string): string {
-  return `⚠ dispatch-relay：轉送失敗（${truncate(reason, 80)}），已請 worker 自行 SendMessage`
+  return `⚠ dispatch-relay：轉送失敗（${truncate(reason, 80)}）${failureHint(classifySendFailure(reason))}，已請 worker 自行 SendMessage`
 }
 
 /**
@@ -416,11 +416,11 @@ export function degradeFailedLine(
   if (outcome.heldReply) parts.push('暫存的等待中回覆不會重送')
   if (outcome.finalReply) parts.push('本則最終回覆不會重送')
   if (outcome.result !== 'resend' || outcome.finalReply || outcome.heldReply) parts.push('請指揮站以完成條件判定進度')
-  return `⚠ dispatch-relay：轉送失敗（${truncate(sendReason, 80)}），也無法請 worker 自行送出（${truncate(submitReason, 80)}）；${parts.join('；')}`
+  return `⚠ dispatch-relay：轉送失敗（${truncate(sendReason, 80)}）${failureHint(classifySendFailure(sendReason))}，也無法請 worker 自行送出（${truncate(submitReason, 80)}）；${parts.join('；')}`
 }
 
 export function failedAgainLine(reason: string): string {
-  return `⚠ dispatch-relay：降級 turn 內轉送再度失敗（${truncate(reason, 80)}），不再請 worker 自送；請指揮站以完成條件判定進度`
+  return `⚠ dispatch-relay：降級 turn 內轉送再度失敗（${truncate(reason, 80)}）${failureHint(classifySendFailure(reason))}，不再請 worker 自送；請指揮站以完成條件判定進度`
 }
 
 /** 降級 prompt 可引用的收件位址。`lastDelivered`：最近一次成功送達時引擎實際使用的位址。 */
@@ -524,8 +524,11 @@ export function shouldHold(i: { answer: string; resultChanged: boolean; selfSent
   return !i.mustFlush && i.pending > 0 && !i.selfSent && !i.resultChanged && i.answer.trim() !== ''
 }
 
-/** 帳上一筆：背景工作以 id 對回通知；排程以 prompt 原文對回觸發（觸發 prompt 不帶 id）。 */
-export type BgEntry = { id?: string; text?: string }
+/**
+ * 帳上一筆：背景工作以 id 對回通知；排程以 prompt 原文對回觸發（觸發 prompt 不帶 id）。
+ * 排程的識別放在 `sched`、不放 `id`：`id` 的有無是背景工作類／排程類的判定（bgSettle 的同類銷帳依此分）。
+ */
+export type BgEntry = { id?: string; text?: string; sched?: { cronId?: string; wake?: true } }
 
 const nonEmpty = (v: unknown): v is string => typeof v === 'string' && v !== ''
 
@@ -533,7 +536,8 @@ const nonEmpty = (v: unknown): v is string => typeof v === 'string' && v !== ''
  * `tool.call` 結果 → 要登的帳；沒有（失敗、前景、會隨最終回覆終止）回 null。
  * 工具參數在事件頂層（Bash 事件的 keys 為 command、description、tool、tool_use_id，沒有 `input`）；
  * 同時容忍 `input` 內層形狀，讀不到 prompt 時退為空字串（對不上 scheduled-trigger 只會走「銷最舊的排程」）。
- * TaskStop 不在這裡登帳；它的銷帳見 `stoppedTaskIdOf`／`bgSettleStopped`。
+ * `ScheduleWakeup` 的 `stop: true` 結果也帶 `scheduledFor`（Claude Code 2.1.301 實測為 0），以 `stopped` 排除：它是銷帳，不是登帳。
+ * TaskStop、CronDelete、ScheduleWakeup stop 不在這裡登帳；它們的銷帳見 `stoppedTaskIdOf`／`deletedCronIdOf`／`wakeStoppedOf`。
  */
 export function bgEntryOf(tool: string, event: { prompt?: unknown; input?: { prompt?: unknown } }, result: unknown): BgEntry | null {
   const prompt = event?.prompt ?? event?.input?.prompt
@@ -547,12 +551,18 @@ export function bgEntryOf(tool: string, event: { prompt?: unknown; input?: { pro
     case 'Task':
       return r.isAsync === true && nonEmpty(r.agentId) ? { id: r.agentId } : null
     case 'ScheduleWakeup':
-      return r.scheduledFor !== undefined ? { text: String(prompt ?? '') } : null
+      return r.scheduledFor !== undefined && r.stopped !== true ? { text: String(prompt ?? ''), sched: { wake: true } } : null
     case 'CronCreate':
-      return nonEmpty(r.id) ? { text: String(prompt ?? '') } : null
+      return nonEmpty(r.id) ? { text: String(prompt ?? ''), sched: { cronId: r.id } } : null
     default:
       return null
   }
+}
+
+/** 登一筆帳（不就地修改）。新的喚醒取代既有的待觸發喚醒（同一 session 只會有一個），所以先移除舊的喚醒類。 */
+export function bgRegister(entries: readonly BgEntry[], entry: BgEntry): BgEntry[] {
+  const kept = entry.sched?.wake ? entries.filter(en => !en.sched?.wake) : entries
+  return [...kept, entry]
 }
 
 /**
@@ -601,4 +611,50 @@ export function stoppedTaskIdOf(tool: string, result: unknown, isError: unknown)
 export function bgSettleStopped(entries: readonly BgEntry[], id: string): BgEntry[] {
   const i = entries.findIndex(en => en.id === id)
   return i >= 0 ? entries.filter((_, j) => j !== i) : [...entries]
+}
+
+/**
+ * `CronDelete` 的 `tool.call` → 被刪掉的排程 id；失敗或取不到回 null（不猜）。輸入 `id` 在事件頂層，
+ * 成功結果為 `{ id }`、沒有 `isError`；失敗時 `isError` 為真、結果為字串 `"Error: No scheduled job with id '…'"`。
+ * id 取輸入，同時容忍 `input` 內層形狀。
+ */
+export function deletedCronIdOf(tool: string, event: { id?: unknown; input?: { id?: unknown } }, isError: unknown): string | null {
+  if (tool !== 'CronDelete' || isError) return null
+  const id = event?.id ?? event?.input?.id
+  return nonEmpty(id) ? id : null
+}
+
+/** 銷掉排程 id 相符的那一筆（不就地修改）；對不上不動帳，不動背景工作類。 */
+export function bgSettleCron(entries: readonly BgEntry[], cronId: string): BgEntry[] {
+  const i = entries.findIndex(en => en.sched?.cronId === cronId)
+  return i >= 0 ? entries.filter((_, j) => j !== i) : [...entries]
+}
+
+/** `ScheduleWakeup` 以 `stop: true` 成功結束？結果為 `{ …, stopped: true, cancelledWakeups: N }`。 */
+export function wakeStoppedOf(tool: string, result: unknown, isError: unknown): boolean {
+  if (tool !== 'ScheduleWakeup' || isError) return false
+  return result !== null && typeof result === 'object' && (result as any).stopped === true
+}
+
+/** 銷掉全部喚醒類（停止後不會再有喚醒觸發）；不動 CronCreate 登的排程與背景工作類。 */
+export function bgSettleWake(entries: readonly BgEntry[]): BgEntry[] {
+  return entries.filter(en => !en.sched?.wake)
+}
+
+// ── 轉送失敗的分類 ──────────────────────────────────────────────────────────
+
+/** Claude Code 2.1.296 的引擎原文。字串改版時分類退回 `other`，即沒有這段說明時的行為。 */
+const ROSTER_MISSING_RE = /no live session on this machine has id/
+
+export type SendFailureKind = 'roster-missing' | 'other'
+
+export function classifySendFailure(reason: string): SendFailureKind {
+  return ROSTER_MISSING_RE.test(reason) ? 'roster-missing' : 'other'
+}
+
+/** 「名冊查無指揮站」型附在畫面與日誌的說明；其他型為空字串。 */
+export function failureHint(kind: SendFailureKind): string {
+  return kind === 'roster-missing'
+    ? '（名冊以 session id 查不到指揮站，指揮站程序可能仍存活——名冊該列缺 pid 時即為此型；降級時請 worker 改用指揮站名稱或其來訊的 from 位址自送）'
+    : ''
 }

@@ -9,15 +9,23 @@ import {
   HOLD_LIMIT_MS,
   WAKE_TEXT,
   bgEntryOf,
+  bgRegister,
   bgSettle,
+  bgSettleCron,
   bgSettleStopped,
+  bgSettleWake,
   buildMessage,
   checkResultFile,
   classifyRecipient,
+  classifySendFailure,
   configRefusal,
   degradeFailedLine,
   degradePrompt,
+  degradedLine,
+  deletedCronIdOf,
   dirRefusal,
+  failedAgainLine,
+  failureHint,
   findIdentity,
   inactiveLog,
   injectionText,
@@ -33,6 +41,7 @@ import {
   stoppedTaskIdOf,
   submitFailure,
   trySubmit,
+  wakeStoppedOf,
 } from '../hooks/logic'
 import type { RelayMission } from '../hooks/logic'
 
@@ -701,6 +710,17 @@ describe('降級', () => {
     expect(text).toContain('再度失敗')
   })
 
+  test('名冊查無指揮站型的送件失敗：畫面與日誌附辨識說明，降級規則不變', async ($: any, on: any) => {
+    const reason = 'no live session on this machine has id 7f3a'
+    const w = world(on, { files: { [`${DIR}/shop.json`]: mission({ nodes: NODES }), [RESULT]: 'A\n' }, send: [{ isDelivered: false, reason }] })
+    await start($, on)
+    const text = await runTurn($, '做完了')
+    expect(text).toContain('缺 pid')
+    expect(w.logs.some(l => l.includes('缺 pid'))).toBe(true)
+    expect(w.prompts.length).toBe(1) // 仍照原規則請 worker 自送一次
+    expect(w.store.get(KEY)).toBe('A\n')
+  })
+
   test('送件拋例外同樣降級', async ($: any, on: any) => {
     const w = world(on, { files: { [`${DIR}/shop.json`]: mission({ nodes: NODES }), [RESULT]: 'A\n' }, send: ['throw'] })
     await start($, on)
@@ -784,8 +804,10 @@ describe('logic：暫存與背景工作帳', () => {
     expect(bgEntryOf('Monitor', {}, { taskId: 'm1' })).toEqual({ id: 'm1' })
     expect(bgEntryOf('Agent', {}, { isAsync: true, agentId: 'a1' })).toEqual({ id: 'a1' })
     expect(bgEntryOf('Agent', {}, { agentId: 'a1' })).toBeNull()
-    expect(bgEntryOf('ScheduleWakeup', { prompt: 'check' }, { scheduledFor: 1 })).toEqual({ text: 'check' })
-    expect(bgEntryOf('CronCreate', { input: { prompt: 'tick' } }, { id: 'c1' })).toEqual({ text: 'tick' })
+    expect(bgEntryOf('ScheduleWakeup', { prompt: 'check' }, { scheduledFor: 1 })).toEqual({ text: 'check', sched: { wake: true } })
+    expect(bgEntryOf('CronCreate', { input: { prompt: 'tick' } }, { id: 'c1' })).toEqual({ text: 'tick', sched: { cronId: 'c1' } })
+    // stop: true 的結果也帶 scheduledFor（為 0），是銷帳不是登帳
+    expect(bgEntryOf('ScheduleWakeup', { prompt: 'check' }, { scheduledFor: 0, stopped: true, cancelledWakeups: 1 })).toBeNull()
     expect(bgEntryOf('TaskStop', {}, { ok: true })).toBeNull()
     expect(bgEntryOf('Bash', {}, undefined)).toBeNull()
   })
@@ -825,6 +847,53 @@ describe('logic：暫存與背景工作帳', () => {
     expect(bgSettleStopped(ledger, 'zzz')).toEqual(ledger)
     expect(bgSettleStopped([], 'b1')).toEqual([])
     expect(ledger.length).toBe(3)
+  })
+
+  test('deletedCronIdOf：只認成功的 CronDelete 且帶非空 id（取輸入，容忍 input 內層）；失敗、缺 id、別的工具都不算', async () => {
+    expect(deletedCronIdOf('CronDelete', { id: 'c1' }, undefined)).toBe('c1')
+    expect(deletedCronIdOf('CronDelete', { input: { id: 'c2' } }, false)).toBe('c2')
+    expect(deletedCronIdOf('CronDelete', { id: 'c1' }, true)).toBeNull()
+    expect(deletedCronIdOf('CronDelete', {}, undefined)).toBeNull()
+    expect(deletedCronIdOf('CronDelete', { id: '' }, undefined)).toBeNull()
+    expect(deletedCronIdOf('CronCreate', { id: 'c1' }, undefined)).toBeNull()
+  })
+
+  test('wakeStoppedOf：只認成功且 stopped 為真的 ScheduleWakeup', async () => {
+    expect(wakeStoppedOf('ScheduleWakeup', { scheduledFor: 0, stopped: true, cancelledWakeups: 1 }, undefined)).toBe(true)
+    expect(wakeStoppedOf('ScheduleWakeup', { scheduledFor: 0, stopped: true }, true)).toBe(false)
+    expect(wakeStoppedOf('ScheduleWakeup', { scheduledFor: 1234 }, undefined)).toBe(false)
+    expect(wakeStoppedOf('ScheduleWakeup', 'Error: x', undefined)).toBe(false)
+    expect(wakeStoppedOf('CronDelete', { stopped: true }, undefined)).toBe(false)
+  })
+
+  test('bgRegister：新的喚醒取代舊的喚醒；cron 排程與背景工作不受影響；不就地修改', async () => {
+    const ledger = [{ id: 'b1' }, { text: 'old', sched: { wake: true as const } }, { text: 'tick', sched: { cronId: 'c1' } }]
+    const next = bgRegister(ledger, { text: 'new', sched: { wake: true } })
+    expect(next).toEqual([{ id: 'b1' }, { text: 'tick', sched: { cronId: 'c1' } }, { text: 'new', sched: { wake: true } }])
+    expect(bgRegister(ledger, { id: 'b2' })).toEqual([...ledger, { id: 'b2' }])
+    expect(bgRegister(ledger, { text: 't2', sched: { cronId: 'c2' } }).length).toBe(4)
+    expect(ledger.length).toBe(3)
+  })
+
+  test('bgSettleCron／bgSettleWake：只銷 cronId 相符的一筆／全部喚醒類；對不上不動帳', async () => {
+    const ledger = [{ id: 'b1' }, { text: 'w', sched: { wake: true as const } }, { text: 'a', sched: { cronId: 'c1' } }, { text: 'b', sched: { cronId: 'c2' } }]
+    expect(bgSettleCron(ledger, 'c1')).toEqual([ledger[0], ledger[1], ledger[3]])
+    expect(bgSettleCron(ledger, 'zzz')).toEqual(ledger)
+    expect(bgSettleWake(ledger)).toEqual([ledger[0], ledger[2], ledger[3]])
+    expect(ledger.length).toBe(4)
+  })
+
+  test('classifySendFailure／failureHint：名冊查無指揮站型附說明，其餘型不變', async () => {
+    const roster = 'Error: no live session on this machine has id 7f3a'
+    expect(classifySendFailure(roster)).toBe('roster-missing')
+    expect(classifySendFailure('gone')).toBe('other')
+    expect(failureHint('other')).toBe('')
+    expect(failureHint('roster-missing')).toContain('缺 pid')
+    expect(degradedLine(roster)).toContain('缺 pid')
+    expect(degradedLine('gone')).not.toContain('缺 pid')
+    expect(failedAgainLine(roster)).toContain('缺 pid')
+    expect(degradeFailedLine(roster, 'blocked', { result: 'resend', finalReply: false })).toContain('缺 pid')
+    expect(degradeFailedLine('gone', 'blocked', { result: 'resend', finalReply: false })).not.toContain('缺 pid')
   })
 
   test('degradeFailedLine／degradePrompt／injectionText 涵蓋 held-reply', async () => {
@@ -1130,6 +1199,99 @@ describe('暫存的等待中回覆與時限叫醒', () => {
     await runTurn($, 'CI 綠了')
     expect(w.sends.length).toBe(1)
     expect(head(w.sends[0]!.text)).toMatch(/parts=held-reply,final-reply /)
+  })
+
+  const CRON_CREATE = { tool: 'CronCreate', cron: '*/5 * * * *', prompt: 'tick' }
+
+  test('CronDelete 成功：銷掉 CronCreate 登的那一筆，其後的進度回覆在本 turn 送出', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    w.toolResults.CronCreate = { id: 'cr1' }
+    await start($, on)
+    await submit($)
+    await runTurn($, '排好定時', { calls: [CRON_CREATE] })
+    expect(w.store.has(HELD)).toBe(true)
+    w.toolResults.CronDelete = { id: 'cr1' }
+    await runTurn($, '已刪掉排程', { calls: [{ tool: 'CronDelete', id: 'cr1' }] })
+    expect(w.sends.length).toBe(1)
+    expect(head(w.sends[0]!.text)).toMatch(/parts=held-reply,final-reply /)
+    expect(w.store.has(HELD)).toBe(false)
+  })
+
+  test('CronDelete 失敗或 id 對不上：不動帳，等待中的 turn 照現行規則暫存', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    w.toolResults.CronCreate = { id: 'cr1' }
+    await start($, on)
+    await submit($)
+    await runTurn($, '排好定時', { calls: [CRON_CREATE] })
+    w.toolResults.CronDelete = "Error: No scheduled job with id 'zzz'"
+    w.toolErrors.add('CronDelete')
+    await runTurn($, '刪不存在的', { calls: [{ tool: 'CronDelete', id: 'zzz' }] })
+    expect(w.sends).toEqual([])
+    w.toolErrors.delete('CronDelete')
+    w.toolResults.CronDelete = { id: 'other' }
+    await runTurn($, '刪別的', { calls: [{ tool: 'CronDelete', id: 'other' }] })
+    expect(w.sends).toEqual([])
+    expect(w.store.has(HELD)).toBe(true)
+  })
+
+  test('ScheduleWakeup stop：不登帳，且銷掉先前的喚醒', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    w.toolResults.ScheduleWakeup = { scheduledFor: 1234, clampedDelaySeconds: 60, wasClamped: false }
+    await start($, on)
+    await submit($)
+    await runTurn($, '等排程', { calls: [{ tool: 'ScheduleWakeup', delaySeconds: 60, prompt: 'check-ci', reason: 'poll' }] })
+    expect(w.store.has(HELD)).toBe(true)
+    w.toolResults.ScheduleWakeup = { scheduledFor: 0, stopped: true, cancelledWakeups: 1 }
+    await runTurn($, '停掉排程', { calls: [{ tool: 'ScheduleWakeup', stop: true }] })
+    expect(w.sends.length).toBe(1)
+    expect(w.store.has(HELD)).toBe(false)
+    // 帳已空：stop 本身沒有被登成新的待觸發喚醒
+    await runTurn($, '收尾')
+    expect(w.sends.length).toBe(2)
+    expect(w.store.has(HELD)).toBe(false)
+  })
+
+  test('ScheduleWakeup stop 在帳上本來沒有喚醒時：不登帳（不誤暫存）', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    w.toolResults.ScheduleWakeup = { scheduledFor: 0, stopped: true, cancelledWakeups: 0 }
+    await start($, on)
+    await submit($)
+    await runTurn($, '停止排程', { calls: [{ tool: 'ScheduleWakeup', stop: true }] })
+    expect(w.sends.length).toBe(1)
+    expect(w.store.has(HELD)).toBe(false)
+  })
+
+  test('新的 ScheduleWakeup 取代舊的：一次觸發即清空帳，不留殘帳', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    w.toolResults.ScheduleWakeup = { scheduledFor: 1234, clampedDelaySeconds: 60, wasClamped: false }
+    await start($, on)
+    await submit($)
+    await runTurn($, '排第一個', { calls: [{ tool: 'ScheduleWakeup', delaySeconds: 60, prompt: 'first', reason: 'poll' }] })
+    await runTurn($, '改排第二個', { calls: [{ tool: 'ScheduleWakeup', delaySeconds: 60, prompt: 'second', reason: 'poll' }] })
+    expect(w.sends).toEqual([])
+    await notify($, 'second', 'scheduled-trigger')
+    await runTurn($, '觸發了')
+    expect(w.sends.length).toBe(1)
+    await runTurn($, '之後')
+    expect(w.sends.length).toBe(2) // 帳已空，立即送出
+  })
+
+  test('subagent 內的 CronDelete 不動帳', async ($: any, on: any) => {
+    const w = world(on)
+    mock.clock(on)
+    w.toolResults.CronCreate = { id: 'cr1' }
+    await start($, on)
+    await submit($)
+    await runTurn($, '排好定時', { calls: [CRON_CREATE] })
+    w.toolResults.CronDelete = { id: 'cr1' }
+    await runTurn($, '二', { calls: [{ tool: 'CronDelete', id: 'cr1', agentId: 'sub-1' }] })
+    expect(w.sends).toEqual([])
+    expect(w.store.has(HELD)).toBe(true)
   })
 
   test('subagent 內的背景呼叫與隨最終回覆終止的背景指令都不登帳：照現行規則立即送出', async ($: any, on: any) => {

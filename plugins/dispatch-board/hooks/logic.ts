@@ -73,7 +73,7 @@ export function dirRefusal(f: DirFacts): string | null {
 }
 
 /**
- * 自訂的 missions_dir 必須來自使用者層級設定（~/.claude/settings.json）。
+ * 自訂的 missions_dir 必須來自使用者層級設定（`$.settings.read({ source: 'user' })`，通常是 ~/.claude/settings.json）。
  * 專案的 .claude/settings.json 也能寫 pluginConfigs；不檢查來源的話，clone 一個陌生 repo
  * 就能把目錄指到別處。預設值不需要來源。
  */
@@ -87,7 +87,7 @@ export function configRefusal(configured: string, userSettings: Readonly<Record<
       if (options && options.missions_dir === configured) return null
     }
   }
-  return 'missions_dir 只接受使用者層級設定（~/.claude/settings.json）；其他來源的值不採用'
+  return 'missions_dir 只接受使用者層級設定（通常是 ~/.claude/settings.json）；其他來源的值不採用'
 }
 
 /** 家目錄縮寫成 ~，顯示用。 */
