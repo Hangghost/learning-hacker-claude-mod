@@ -28,16 +28,22 @@ import {
   SECTION_ID,
   WAKE_TEXT,
   bgEntryOf,
+  bgRegister,
   bgSettle,
+  bgSettleCron,
   bgSettleStopped,
+  bgSettleWake,
   buildMessage,
+  classifySendFailure,
   degradeFailedLine,
   degradePrompt,
   degradedLine,
+  deletedCronIdOf,
   deliveredLine,
   dirRefusal,
   expandDir,
   failedAgainLine,
+  failureHint,
   findIdentity,
   gitProbePaths,
   heldLine,
@@ -58,6 +64,7 @@ import {
   stoppedTaskIdOf,
   truncate,
   trySubmit,
+  wakeStoppedOf,
 } from './logic'
 import type { BgEntry, Built, Held, Identity, RelayMission, Resolution, Roster } from './logic'
 
@@ -447,7 +454,7 @@ async function flushOnEnd($: any): Promise<void> {
   }
   await clearHeld($, root)
   const sent = await forward($, buildMessage(identity, undefined, null, '', true, held.text), { sessionId: lastStationId })
-  if (!sent.ok) log($, `session 結束時暫存的等待中回覆未能送出（不會重送）：${truncate(sent.reason, 120)}`)
+  if (!sent.ok) log($, `session 結束時暫存的等待中回覆未能送出（不會重送）：${truncate(sent.reason, 120)}${failureHint(classifySendFailure(sent.reason))}`)
 }
 
 export const register: Register = (on, options) => {
@@ -487,16 +494,19 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // 只觀察、原樣放行：登帳與 TaskStop 銷帳。結果在 next(e) 之後才看得到 task id；只處理主迴圈（agentId 為 undefined）的呼叫。
-  // TaskStop 成功才銷（`isError` 在結果上，不在 `result` 內）；停掉的背景 Bash／Monitor 沒有完成通知。
+  // 只觀察、原樣放行：登帳與 TaskStop／CronDelete／ScheduleWakeup stop 銷帳。結果在 next(e) 之後才看得到 task id；只處理主迴圈（agentId 為 undefined）的呼叫。
+  // 三者都是成功才銷（`isError` 在結果上，不在 `result` 內）；停掉的背景 Bash／Monitor、刪掉或停止的排程都沒有後續通知。
   on('tool.call', async ($, e, next) => {
     const r = await next(e)
     if (identity !== null && (e as any).agentId === undefined) {
       const tool = String((e as any).tool)
       const entry = bgEntryOf(tool, e as any, (r as any)?.result)
-      if (entry !== null) ledger = [...ledger, entry]
+      if (entry !== null) ledger = bgRegister(ledger, entry)
       const stopped = stoppedTaskIdOf(tool, (r as any)?.result, (r as any)?.isError)
       if (stopped !== null) ledger = bgSettleStopped(ledger, stopped)
+      const cronId = deletedCronIdOf(tool, e as any, (r as any)?.isError)
+      if (cronId !== null) ledger = bgSettleCron(ledger, cronId)
+      if (wakeStoppedOf(tool, (r as any)?.result, (r as any)?.isError)) ledger = bgSettleWake(ledger)
     }
     return r
   })
@@ -596,9 +606,11 @@ export const register: Register = (on, options) => {
       return { ...r, text: deliveredLine(built, id.station) }
     }
     // 失敗：先把內容記為已處理，才排降級 turn——順序顛倒時，worker 在補記之前就自送並結束 turn 會被重送。
+    const hint = failureHint(classifySendFailure(sent.reason))
+    if (hint) log($, `轉送失敗：${truncate(sent.reason, 160)}${hint}`)
     if (built.nextSent !== null) await markSent($, key, built.nextSent)
     if (wasDegraded) {
-      log($, `降級 turn 內轉送再度失敗：${truncate(sent.reason, 120)}`)
+      log($, `降級 turn 內轉送再度失敗：${truncate(sent.reason, 120)}${hint}`)
       return { ...r, text: failedAgainLine(sent.reason) }
     }
     const queued = await degrade($, id, built, sent.reason)
